@@ -73,7 +73,7 @@ fn handle_bootstrap(state: &mut State, data: &[u8], src_ipv4: [u8; 4], now_ms: u
                 in_use: true,
                 sender_id: d.header.sender_id,
                 sender_ipv4: src_ipv4,
-                cluster_slot: cs as u8,
+                cluster_slot: cs as u16,
                 last_rx_ms: now_ms,
                 last_rx_sequence: 0,
                 last_tx_sequence: 0,

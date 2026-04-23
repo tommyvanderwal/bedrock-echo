@@ -33,9 +33,26 @@
 #define ECHO_BOOTSTRAP_INIT_PAYLOAD_MAX 96u
 
 // ─── Witness state sizing (PROTOCOL.md §8) ──────────────────────────────────
-#define ECHO_MAX_NODES 64u
-#define ECHO_MAX_CLUSTERS 32u
-#define ECHO_MAX_TRACKED_IPS 128u
+// "Big" ESP32 profile — uses a healthy chunk of the classic ESP32's free
+// DRAM for static state tables while leaving comfortable headroom for
+// LwIP + FreeRTOS + mbedTLS runtime heap.
+//
+//   static state budget:
+//     256 nodes    × ~192 B  = ~49 KB
+//     128 clusters × ~48 B   = ~6 KB
+//     192 rate bkt × ~28 B   = ~5 KB
+//                              ──────
+//                              ~60 KB .bss on libmain
+//
+// ESP32 classic has 180 KB DRAM; ESP-IDF baseline uses ~12 KB .bss + .data,
+// leaving ~168 KB. After our ~60 KB of state, ~108 KB remains for the heap,
+// which keeps LwIP pbufs + FreeRTOS task stacks + mbedTLS AEAD workspaces
+// comfortable under sustained load. A previous attempt at 512×256×256
+// (~117 KB state, ~50 KB heap) booted once but became unresponsive and
+// then failed to re-init — insufficient heap headroom under network load.
+#define ECHO_MAX_NODES       256u
+#define ECHO_MAX_CLUSTERS    128u
+#define ECHO_MAX_TRACKED_IPS 192u
 
 #define ECHO_UDP_PORT_DEFAULT 12321u
 
@@ -123,7 +140,7 @@ typedef struct {
     bool in_use;
     uint8_t sender_id[ECHO_SENDER_ID_LEN];
     uint8_t sender_ipv4[4];
-    uint8_t cluster_slot;
+    uint16_t cluster_slot;   // widened from u8 — supports MAX_CLUSTERS up to 2^16
     uint64_t last_rx_ms;
     uint64_t last_rx_sequence;
     uint64_t last_tx_sequence;

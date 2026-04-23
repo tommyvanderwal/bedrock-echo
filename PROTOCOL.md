@@ -161,6 +161,12 @@ state of a single peer. This is the common-case query in a 2- or 3-node
 cluster: each node heartbeats "here's me, give me my peer's full payload" and
 gets back exactly one peer's `own_payload`.
 
+**Self-query is allowed and sometimes useful.** A node MAY set
+`query_target_id == its own sender_id`. The witness replies with that node's
+own most-recently-recorded state — essentially a verification that the
+witness received the requester's last heartbeat. This enables the
+advertise-verify-act pattern described in Appendix A.
+
 Payload structure (when peer is found, `status == 0`):
 
 ```
@@ -441,18 +447,23 @@ No "try all cluster keys" scan is required. First-time sender_id = UNKNOWN_SOURC
 
 ## 10. Dynamic timeouts (age-out)
 
-| Node table fill        | Age-out after |
-|------------------------|---------------|
-| < 25% (< 16 entries)   | 72 hours      |
-| 25% – 75%              | 1 hour        |
-| > 75% (> 48 entries)   | 5 minutes     |
+| Node table fill | Age-out after |
+|---|---|
+| 0 – 80% | **72 hours** |
+| 80% – 90% | **4 hours** |
+| > 90% | **5 minutes** |
+
+Generous timeouts at normal fill let a witness be an authoritative
+source of a peer's last-known state across multi-day planned outages
+(see the recovery-after-total-outage pattern in §A). Only genuinely
+overloaded witnesses (>90% full) aggressively reclaim.
 
 Age-out: delete the node entry. If the cluster has no remaining nodes,
 also delete the cluster entry.
 
-The `last_seen_seconds` field in STATUS replies is `u32` so values up to ~136
-years represent cleanly; the 72-hour cap just means entries disappear rather
-than showing huge numbers.
+The `last_seen_seconds` field in STATUS replies is `u32` so values up to
+~136 years represent cleanly; the 72-hour cap just means entries
+disappear rather than showing huge numbers.
 
 ---
 
@@ -647,5 +658,113 @@ specified):
 No specific extension is committed to here. Extensions are added only when
 a concrete need in a deployed system proves they are worth fracturing the
 currently-simple spec.
+
+---
+
+## Appendix A — Recovery-after-total-outage using the 128-byte payload
+
+**Non-normative.** This appendix describes a design pattern applications
+may use on top of the Echo protocol. It is not part of the wire format
+and does not affect what a witness implementation must do. Compliant
+witnesses already support it by virtue of faithfully echoing opaque
+128-byte payloads.
+
+### A.1 Problem
+
+A two-node cluster experiences a total power outage. One node dies
+permanently; the other comes back hours later. The survivor must decide
+whether it is safe to resume serving data unilaterally. Without
+external evidence, it cannot distinguish "peer died while we were
+synchronised" (safe) from "peer had newer data I never saw" (unsafe).
+
+### A.2 Ingredients
+
+- A battery-backed witness that retains its RAM state across the
+  outage (e.g., a few-hour UPS-grade battery matching the witness's
+  age-out window; see §10).
+- Nodes that include their current application state (e.g., DRBD UUIDs,
+  log tip hashes) in each HEARTBEAT's 128-byte `own_payload` field.
+- **The invariant: a node MUST advertise its new intended state via
+  heartbeat, and verify that the witness recorded it, BEFORE taking any
+  action that would persist the state change.**
+
+### A.3 The advertise-verify-act pattern
+
+```
+  Node about to take a persistent action (promote, write, elect self):
+
+   1. Prepare the new state locally (compute new UUID, log entry, …).
+   2. HEARTBEAT the witness with the new state as payload:
+         intent: "I'm about to become Primary of R, new uuid will be X"
+   3. STATUS_DETAIL self-query:
+         target_sender_id = my_sender_id
+   4. If witness's stored payload == what I just sent in step 2:
+         → the intent is externally recorded
+         → proceed with step 5
+      Else (packet loss, witness offline, rate-limited, ...):
+         → abort or retry from step 2
+   5. Perform the actual action locally.
+   6. HEARTBEAT again with the completed state:
+         committed: "I am Primary of R, uuid=X"
+```
+
+### A.4 Why this is safe
+
+**The invariant combined with witness durability guarantees:** if a
+state change reached completion, its intent was recorded by the witness
+first. Therefore, for any node that has silently gone away, the
+witness's last-recorded payload reflects either:
+
+- The state at which that node last successfully advertised intent
+  (which, if never followed by a completion, means it never actually
+  took the action), or
+- The state after a completed action.
+
+Either way, a surviving node can read its peer's last-known state,
+compare to its own local state, and know whether the two sides
+diverged.
+
+### A.5 Recovery decision rule (DRBD example)
+
+```
+  Survivor S boots after outage. Queries STATUS_DETAIL for peer P:
+
+   S_state = local DRBD uuid
+   P_state = witness's recorded P payload
+   P_age   = witness's last_seen_seconds for P
+
+   If P_age < network_blip_threshold (e.g. 30 seconds):
+       → peer is alive and booting too. Hold; converge via peer-to-peer.
+   Else if P_state.uuid == S_state.uuid:
+       → we were synchronised at peer's last-known checkpoint.
+       → no writes happened since.
+       → SAFE to promote (following advertise-verify-act for the promotion).
+   Else if P_state.uuid newer than S_state.uuid:
+       → peer had data we don't.
+       → UNSAFE; refuse; alert operator.
+   Else if P_state.uuid older than S_state.uuid:
+       → we are ahead. Proceed.
+
+   If witness has no record of P (age-out or witness reboot):
+       → no external evidence. UNSAFE; operator intervention required.
+```
+
+### A.6 Failure mode coverage
+
+| Failure | Behaviour |
+|---|---|
+| Witness also lost power (battery dead) | No peer record → refuse auto-promote → alert operator |
+| Peer partially returned and wrote during outage | Peer's last_seen is recent, newer uuid → mismatch detected, survivor refuses |
+| Two nodes boot simultaneously | Both see peer's last_seen is tiny (< threshold) → both hold → peer-to-peer sync wins |
+| Survivor crashes between step 4 (verified) and step 5 (action) | Intent recorded but action not executed → on reboot, recovery logic can safely re-drive (idempotent actions only) or flag for operator |
+| Survivor crashes between step 5 (action) and step 6 (announce completion) | Local state advanced but witness doesn't know → next boot, local-state > witness-view-of-self triggers "advance witness first, then continue" |
+
+### A.7 Payload schema is application-defined
+
+Each application defines its own 128-byte payload schema. DRBD would
+put per-resource UUIDs and roles. A Raft implementation would put term
+and last-applied-index. Bedrock specifically uses a cluster-log tip
+hash (see `docs/bedrock-cluster-log.md`). The Echo witness treats all
+of these identically — it's 128 opaque bytes per node.
 
 ---

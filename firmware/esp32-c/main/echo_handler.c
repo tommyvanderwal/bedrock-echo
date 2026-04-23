@@ -114,7 +114,7 @@ static bool handle_bootstrap(echo_state_t *state,
     int cluster_slot;
 
     if (existing_idx >= 0) {
-        uint8_t cs = state->nodes[existing_idx].cluster_slot;
+        uint16_t cs = state->nodes[existing_idx].cluster_slot;
         if (cs >= ECHO_MAX_CLUSTERS || !state->clusters[cs].in_use) return false;
         if (memcmp(state->clusters[cs].cluster_key, bs.cluster_key, 32) != 0) {
             // Same sender_id, different cluster_key — silent drop (§4.6).
@@ -145,7 +145,7 @@ static bool handle_bootstrap(echo_state_t *state,
         state->nodes[ns].in_use = true;
         memcpy(state->nodes[ns].sender_id, bs.hdr.sender_id, 8);
         memcpy(state->nodes[ns].sender_ipv4, src_ipv4, 4);
-        state->nodes[ns].cluster_slot = (uint8_t)cs;
+        state->nodes[ns].cluster_slot = (uint16_t)cs;
         state->nodes[ns].last_rx_ms = now_ms;
         state->nodes[ns].payload_len = (uint8_t)bs.init_payload_len;
         if (bs.init_payload_len)
@@ -178,7 +178,7 @@ static bool handle_heartbeat(echo_state_t *state,
     if (node_idx < 0) {
         return maybe_unknown_source(state, src_ipv4, now_ms, out, out_cap, out_len);
     }
-    uint8_t cs = state->nodes[node_idx].cluster_slot;
+    uint16_t cs = state->nodes[node_idx].cluster_slot;
     if (cs >= ECHO_MAX_CLUSTERS || !state->clusters[cs].in_use) {
         state->nodes[node_idx].in_use = false;
         return maybe_unknown_source(state, src_ipv4, now_ms, out, out_cap, out_len);
@@ -208,8 +208,11 @@ static bool handle_heartbeat(echo_state_t *state,
     // Reply branch: zero target = LIST, non-zero = DETAIL.
     static const uint8_t zero8[8] = {0};
     if (memcmp(hb.query_target_id, zero8, 8) == 0) {
-        // STATUS_LIST: every node entry in the same cluster.
-        echo_list_entry_t entries[ECHO_MAX_NODES];
+        // STATUS_LIST: every node entry in the same cluster (capped at
+        // ECHO_LIST_MAX_ENTRIES = 64 per protocol). Sized to the cap, not
+        // ECHO_MAX_NODES — the task stack is 8 KB and ECHO_MAX_NODES × 16 B
+        // would blow it at bigger profiles.
+        echo_list_entry_t entries[ECHO_LIST_MAX_ENTRIES];
         size_t n = 0;
         for (size_t i = 0; i < ECHO_MAX_NODES; ++i) {
             if (state->nodes[i].in_use

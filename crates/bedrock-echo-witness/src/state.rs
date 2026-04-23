@@ -3,6 +3,8 @@
 
 use bedrock_echo_proto::constants::*;
 
+// "Tiny" profile defaults for the Linux witness binary. ESP32 has its own
+// compile-time constants in firmware/esp32-c/main/echo.h.
 pub const MAX_NODES: usize = 64;
 pub const MAX_CLUSTERS: usize = 32;
 pub const MAX_TRACKED_IPS: usize = 128;
@@ -20,7 +22,7 @@ pub struct NodeEntry {
     pub in_use: bool,
     pub sender_id: [u8; 8],
     pub sender_ipv4: [u8; 4],
-    pub cluster_slot: u8,
+    pub cluster_slot: u16,   // widened from u8 — lets bigger implementations scale to >256 clusters
     pub last_rx_ms: u64,
     pub last_rx_sequence: u64,
     pub last_tx_sequence: u64,
@@ -113,12 +115,17 @@ impl State {
     /// Age out stale node entries. Timeout depends on fill ratio (§10).
     pub fn age_out(&mut self, now_ms: u64) {
         let n = self.node_count();
-        let timeout_ms: u64 = if n < 16 {
-            72 * 3600 * 1000
-        } else if n <= 48 {
-            60 * 60 * 1000
+        // Age-out tiers per PROTOCOL.md §10.  Generous at normal fill
+        // so the witness can back the recovery-after-outage pattern
+        // (Appendix A); only reclaim aggressively when truly overloaded.
+        let tier_80 = (MAX_NODES * 80) / 100;
+        let tier_90 = (MAX_NODES * 90) / 100;
+        let timeout_ms: u64 = if n <= tier_80 {
+            72 * 3600 * 1000          // 0–80%: 72h
+        } else if n <= tier_90 {
+            4 * 3600 * 1000           // 80–90%: 4h
         } else {
-            5 * 60 * 1000
+            5 * 60 * 1000             // >90%: 5min
         };
         for i in 0..MAX_NODES {
             if !self.nodes[i].in_use { continue; }

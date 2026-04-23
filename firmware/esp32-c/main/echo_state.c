@@ -32,9 +32,14 @@ static size_t count_nodes(const echo_state_t *state) {
 }
 
 static uint64_t age_out_timeout_ms(size_t nodes_in_use) {
-    if (nodes_in_use < 16) return 72ULL * 3600ULL * 1000ULL;      // 72h
-    if (nodes_in_use <= 48) return 1ULL * 3600ULL * 1000ULL;      // 1h
-    return 5ULL * 60ULL * 1000ULL;                                 // 5min
+    // Tiers per PROTOCOL.md §10. Generous at normal fill supports the
+    // recovery-after-outage pattern (Appendix A); only reclaim
+    // aggressively when the table is truly overloaded.
+    const size_t tier_80 = (ECHO_MAX_NODES * 80u) / 100u;
+    const size_t tier_90 = (ECHO_MAX_NODES * 90u) / 100u;
+    if (nodes_in_use <= tier_80) return 72ULL * 3600ULL * 1000ULL; // 0–80%: 72h
+    if (nodes_in_use <= tier_90) return 4ULL * 3600ULL * 1000ULL;  // 80–90%: 4h
+    return 5ULL * 60ULL * 1000ULL;                                 // >90%: 5min
 }
 
 void echo_state_age_out(echo_state_t *state, uint64_t now_ms) {
@@ -43,7 +48,7 @@ void echo_state_age_out(echo_state_t *state, uint64_t now_ms) {
     for (size_t i = 0; i < ECHO_MAX_NODES; ++i) {
         if (!state->nodes[i].in_use) continue;
         if (now_ms - state->nodes[i].last_rx_ms > timeout) {
-            uint8_t cs = state->nodes[i].cluster_slot;
+            uint16_t cs = state->nodes[i].cluster_slot;
             state->nodes[i].in_use = false;
             if (cs < ECHO_MAX_CLUSTERS && state->clusters[cs].in_use) {
                 if (state->clusters[cs].num_nodes > 0)

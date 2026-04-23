@@ -39,10 +39,13 @@ RL_BURST = 20
 RL_UNKNOWN_PER_SEC = 1
 
 # age-out tiers (§10), (threshold_inclusive, timeout_ms)
+# Generous at normal fill — supports the recovery-after-outage pattern
+# (Appendix A) across multi-day planned outages. Only kick into aggressive
+# reclaim when genuinely overloaded.
 AGE_OUT_TIERS = (
-    (16, 72 * 3600 * 1000),   # <25% full: 72h
-    (48, 1 * 3600 * 1000),    # 25-75%: 1h
-    (MAX_NODES, 5 * 60 * 1000),  # >75%: 5min
+    (int(MAX_NODES * 0.80), 72 * 3600 * 1000),   # 0–80%: 72h
+    (int(MAX_NODES * 0.90), 4 * 3600 * 1000),    # 80–90%: 4h
+    (MAX_NODES, 5 * 60 * 1000),                  # >90%: 5min
 )
 
 

@@ -46,16 +46,31 @@ NVS. Subsequent boots read the key back. The **only thing persisted**;
 everything else (cluster key table, node table) lives in RAM per the
 design (PROTOCOL.md §1).
 
-### Entropy on first boot
+### First boot flow (generation + forced reboot)
 
-`esp_fill_random()` on a classic ESP32 is **pseudo-random** whenever the
-RF subsystem is idle, per Espressif's own docs — not good enough for a
-long-lived crypto identity. On first boot we therefore call
-`bootloader_random_enable()` before generating the key, which powers up
-the RF analog front-end and seeds the hardware RNG from true noise.
-After ~200 ms of warm-up we read 32 bytes, then `bootloader_random_disable()`
-takes the RF back down. The witness itself never uses WiFi/BT at runtime —
-this is a one-time provisioning step only.
+On a fresh board (NVS empty), the firmware takes a deliberately long
+entropy-collection path before generating the X25519 keypair:
+
+1. `bootloader_random_enable()` — powers up the ESP32's RF analog
+   front-end. The hardware RNG is only true-random while RF is active
+   (per Espressif's docs); without this, `esp_fill_random()` is
+   pseudo-random.
+2. **~2 s of entropy pooling** — reads 40 × 32 bytes of RNG output
+   at 50 ms intervals (so the RNG reseeds between reads) and hashes the
+   whole stream with SHA-256. Overkill for a single 256-bit key, but
+   this code runs exactly once in the board's lifetime — cost of a weak
+   key is forever.
+3. `bootloader_random_disable()` — RF back down. The witness itself
+   never uses WiFi/BT at runtime.
+4. The resulting hash becomes the X25519 private key (after RFC 7748
+   scalar clamping).
+5. Key is persisted to NVS.
+6. Firmware prints a provisioning info block containing `pub=…` and
+   `mac=…` (no IP yet — Ethernet isn't up).
+7. **Firmware calls `esp_restart()`** for a clean steady-state boot.
+
+Subsequent boots are fast: NVS load → state init → Ethernet → DHCP →
+info block with IP → ready.
 
 If you want to re-provision an existing board with a fresh key, erase the
 NVS partition:
@@ -90,6 +105,19 @@ cat /dev/ttyUSB0 | sed -n '/===BEDROCK-ECHO-WITNESS===/,/===END===/p' \
     | awk -F= '/^[a-z]/ {print $1"="$2}'
 # → pub=...  senderid=...  mac=...  ip=...  port=7337
 ```
+
+Additionally, whenever DHCP assigns or renews the Ethernet interface's
+IP, the firmware prints a single-line announcement that's easy to scrape
+even without querying the full block:
+
+```
+DHCP_IP=192.168.2.181
+```
+
+This fires at every DHCP event — first boot after the cable is plugged
+in, lease renewal with a different address, etc. Useful for a Bedrock
+dashboard watching the USB console to know "the board just joined the
+LAN at this address."
 
 **The private key never leaves the device.** No code path prints, transmits,
 or otherwise exposes the X25519 private key after it's written to NVS.

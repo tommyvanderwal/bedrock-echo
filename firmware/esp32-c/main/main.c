@@ -60,6 +60,12 @@ static void on_ip_event(void *arg, esp_event_base_t base, int32_t id, void *data
         ESP_LOGI(TAG, "got IPv4 " IPSTR, IP2STR(&evt->ip_info.ip));
         ESP_LOGI(TAG, "  netmask " IPSTR, IP2STR(&evt->ip_info.netmask));
         ESP_LOGI(TAG, "  gateway " IPSTR, IP2STR(&evt->ip_info.gw));
+        // Dedicated provisioning-facing one-liner. Fires whenever DHCP
+        // lands an address — at first boot, after cable plugin, after
+        // lease renew with a different address, etc. Bedrock dashboard
+        // parses this whenever a board's USB console is visible.
+        printf("DHCP_IP=" IPSTR "\n", IP2STR(&evt->ip_info.ip));
+        fflush(stdout);
         xEventGroupSetBits(s_net_events, GOT_IPV4_BIT);
     }
 }
@@ -126,7 +132,8 @@ void app_main(void) {
 
     // 1. X25519 keypair — from NVS, or fresh on first boot.
     uint8_t priv[32];
-    if (!bew1_key_load_or_generate(priv)) {
+    int key_status = bew1_key_load_or_generate(priv);
+    if (key_status < 0) {
         ESP_LOGE(TAG, "cannot load or generate X25519 private key");
         return;
     }
@@ -135,6 +142,20 @@ void app_main(void) {
     bew1_state_init(&g_state, priv, now_ms());
     hex_dump("witness pub     ", g_state.witness_pub, 32);
     hex_dump("witness senderid", g_state.witness_sender_id, 8);
+
+    // 2a. If this was the first boot (key just generated), print the
+    // provisioning info block and reboot into a clean steady-state boot.
+    // Subsequent boots skip this and proceed straight to Ethernet.
+    if (key_status == 1) {
+        ESP_LOGW(TAG, "first-boot key generation complete — info block below, then reboot");
+        // No netif yet, so `ip=` will show "(no DHCP yet)"; operator gets
+        // pub + MAC on the serial console before the device joins the LAN.
+        bew1_info_print(&g_state, NULL);
+        ESP_LOGW(TAG, "rebooting for a clean steady-state boot ...");
+        vTaskDelay(pdMS_TO_TICKS(500));  // give the UART time to drain
+        esp_restart();
+        // (unreached)
+    }
 
     // 3. Ethernet up + DHCP.
     esp_netif_t *netif = NULL;

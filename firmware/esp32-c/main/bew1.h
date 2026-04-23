@@ -171,6 +171,9 @@ bool bew1_handle_packet(bew1_state_t *state,
                         uint8_t *out, size_t out_cap, size_t *out_len);
 
 // ─── Persistent X25519 key (NVS) ────────────────────────────────────────────
-// Load the X25519 private key from NVS, generating + persisting one on
-// first boot. `out` is 32 bytes. Returns true on success.
-bool bew1_key_load_or_generate(uint8_t out[32]);
+// Load the X25519 private key from NVS. `out` is 32 bytes. Returns:
+//   0  — key loaded from NVS (normal case)
+//   1  — key was just generated and persisted (first boot); caller should
+//        print provisioning info + esp_restart() for a clean subsequent boot
+//  -1  — failure
+int bew1_key_load_or_generate(uint8_t out[32]);

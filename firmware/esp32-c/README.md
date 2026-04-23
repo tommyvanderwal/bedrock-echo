@@ -106,18 +106,12 @@ cat /dev/ttyUSB0 | sed -n '/===BEDROCK-ECHO-WITNESS===/,/===END===/p' \
 # → pub=...  senderid=...  mac=...  ip=...  port=7337
 ```
 
-Additionally, whenever DHCP assigns or renews the Ethernet interface's
-IP, the firmware prints a single-line announcement that's easy to scrape
-even without querying the full block:
-
-```
-DHCP_IP=192.168.2.181
-```
-
-This fires at every DHCP event — first boot after the cable is plugged
-in, lease renewal with a different address, etc. Useful for a Bedrock
-dashboard watching the USB console to know "the board just joined the
-LAN at this address."
+Whenever DHCP assigns or renews the Ethernet interface's IP, the
+existing ESP_LOG line `got IPv4 <addr>` fires — that's the natural
+announcement on every DHCP event (first boot after the cable is plugged
+in, lease renewal with a different address, etc.). A Bedrock dashboard
+watching the USB console can scrape that line to learn "the board just
+joined the LAN at this address."
 
 **The private key never leaves the device.** No code path prints, transmits,
 or otherwise exposes the X25519 private key after it's written to NVS.

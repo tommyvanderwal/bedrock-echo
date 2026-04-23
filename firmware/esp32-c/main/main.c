@@ -57,15 +57,11 @@ static void on_ip_event(void *arg, esp_event_base_t base, int32_t id, void *data
     (void)arg; (void)base;
     if (id == IP_EVENT_ETH_GOT_IP) {
         ip_event_got_ip_t *evt = (ip_event_got_ip_t *)data;
+        // Single DHCP-event announcement — the existing log line is easy
+        // enough to parse with a "got IPv4 " prefix + IPv4 address.
         ESP_LOGI(TAG, "got IPv4 " IPSTR, IP2STR(&evt->ip_info.ip));
         ESP_LOGI(TAG, "  netmask " IPSTR, IP2STR(&evt->ip_info.netmask));
         ESP_LOGI(TAG, "  gateway " IPSTR, IP2STR(&evt->ip_info.gw));
-        // Dedicated provisioning-facing one-liner. Fires whenever DHCP
-        // lands an address — at first boot, after cable plugin, after
-        // lease renew with a different address, etc. Bedrock dashboard
-        // parses this whenever a board's USB console is visible.
-        printf("DHCP_IP=" IPSTR "\n", IP2STR(&evt->ip_info.ip));
-        fflush(stdout);
         xEventGroupSetBits(s_net_events, GOT_IPV4_BIT);
     }
 }

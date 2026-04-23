@@ -4,6 +4,7 @@
 
 #include "bew1.h"
 #include "bew1_eth.h"
+#include "bew1_info.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -146,4 +147,9 @@ void app_main(void) {
     xTaskCreate(udp_server_task, "bew1-udp", 8192, NULL, 5, NULL);
 
     ESP_LOGI(TAG, "witness ready.");
+
+    // 5. Print the provisioning info block (pub / senderid / MAC / IP)
+    //    and start a tiny console that re-prints it on any serial input.
+    bew1_info_print(&g_state, netif);
+    bew1_info_start_console(&g_state, netif);
 }

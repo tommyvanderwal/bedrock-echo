@@ -6,6 +6,7 @@ idf_component_register(
         "bew1_state.c"
         "bew1_handler.c"
         "bew1_eth.c"
+        "bew1_info.c"
         "bew1_key.c"
     INCLUDE_DIRS "."
     REQUIRES
@@ -18,4 +19,5 @@ idf_component_register(
         driver
     PRIV_REQUIRES
         esp_timer
+        bootloader_support
 )

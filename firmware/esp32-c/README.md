@@ -46,18 +46,53 @@ NVS. Subsequent boots read the key back. The **only thing persisted**;
 everything else (cluster key table, node table) lives in RAM per the
 design (PROTOCOL.md §1).
 
-Witness pubkey is logged on boot:
+### Entropy on first boot
+
+`esp_fill_random()` on a classic ESP32 is **pseudo-random** whenever the
+RF subsystem is idle, per Espressif's own docs — not good enough for a
+long-lived crypto identity. On first boot we therefore call
+`bootloader_random_enable()` before generating the key, which powers up
+the RF analog front-end and seeds the hardware RNG from true noise.
+After ~200 ms of warm-up we read 32 bytes, then `bootloader_random_disable()`
+takes the RF back down. The witness itself never uses WiFi/BT at runtime —
+this is a one-time provisioning step only.
+
+If you want to re-provision an existing board with a fresh key, erase the
+NVS partition:
 
 ```
-bew1-key: loaded X25519 private key from NVS
-bew1: witness pub      = 4b8a7347b01e8085a6a7a07a7cdcfcc69ceb1632da640b5e9607145201fdf804
-bew1: witness senderid = 7dada6c02e4993c7
-bew1-eth: PHY power pin GPIO12 driven HIGH
-bew1: Ethernet started
-bew1: got IPv4 192.168.2.181
-bew1: listening on UDP 0.0.0.0:7337
-bew1: witness ready.
+esptool.py --port /dev/ttyUSB0 --chip esp32 erase_region 0x9000 0x6000
 ```
+
+Next boot will run the entropy-seeded key generation again.
+
+### Provisioning info via USB serial
+
+On boot, and on any byte received over the USB serial console, the
+firmware prints a machine-parseable block:
+
+```
+===BEDROCK-ECHO-WITNESS===
+pub=402436752456a377141b9e97a6338538eaa1aa249f3d8a233c5e4526a3134636
+senderid=3c69ecacc9db06bb
+mac=ec:c9:ff:b8:69:f7
+ip=192.168.2.181
+port=7337
+===END===
+```
+
+A node provisioning script can just:
+
+```sh
+# Trigger an info dump and capture fields
+echo '' > /dev/ttyUSB0
+cat /dev/ttyUSB0 | sed -n '/===BEDROCK-ECHO-WITNESS===/,/===END===/p' \
+    | awk -F= '/^[a-z]/ {print $1"="$2}'
+# → pub=...  senderid=...  mac=...  ip=...  port=7337
+```
+
+**The private key never leaves the device.** No code path prints, transmits,
+or otherwise exposes the X25519 private key after it's written to NVS.
 
 ## Board-specific notes (Olimex ESP32-POE-ISO)
 

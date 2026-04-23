@@ -1,0 +1,10 @@
+<network>
+  <name>bec-link2</name>
+  <!-- Second isolated interconnect between the two DRBD nodes (bec-node-a
+       and bec-node-b). Simulates a second direct cable, used for:
+         (a) a second DRBD replication path, and
+         (b) an out-of-band heartbeat/peer-ping ring for the node daemon.
+       Isolated: no NAT, no DHCP, nodes get static IPs via cloud-init.
+       Subnet: 10.88.0.0/24  (a=10.88.0.20, b=10.88.0.21). -->
+  <bridge name='br-beclink2' stp='on' delay='0'/>
+</network>

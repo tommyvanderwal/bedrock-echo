@@ -1,0 +1,115 @@
+//! Bedrock Echo witness — Linux UDP binary.
+//!
+//! Binds a UDP socket, runs the packet dispatcher, responds. RAM-only.
+//! The X25519 private key is persisted to a single file (default
+//! `/var/lib/bedrock-echo/witness.x25519.key`, override with `BEDROCK_ECHO_KEY`).
+
+mod handler;
+mod state;
+
+use std::fs;
+use std::io::Write;
+use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use bedrock_echo_proto::constants::MTU_CAP;
+use rand_core::{OsRng, RngCore};
+
+use handler::handle;
+use state::State;
+
+fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+}
+
+fn load_or_generate_priv(path: &PathBuf) -> [u8; 32] {
+    match fs::read(path) {
+        Ok(bytes) if bytes.len() == 32 => {
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&bytes);
+            k
+        }
+        Ok(_) => panic!("{}: expected 32 raw bytes", path.display()),
+        Err(_) => {
+            // Generate fresh X25519 privkey: 32 bytes of OS randomness,
+            // clamp to be a valid X25519 scalar is not needed for X25519 — the
+            // `StaticSecret::from(bytes)` does that internally.
+            let mut k = [0u8; 32];
+            OsRng.fill_bytes(&mut k);
+            // mkdir -p
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).ok();
+            }
+            let mut opts = fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true).mode(0o600);
+            let mut f = opts.open(path).expect("open keyfile for write");
+            f.write_all(&k).expect("write keyfile");
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+            k
+        }
+    }
+}
+
+fn parse_bind() -> SocketAddr {
+    let host = std::env::var("BEDROCK_ECHO_BIND").unwrap_or_else(|_| "0.0.0.0".into());
+    let port: u16 = std::env::var("BEDROCK_ECHO_PORT").ok()
+        .and_then(|s| s.parse().ok()).unwrap_or(7337);
+    let ip: IpAddr = host.parse().expect("BEDROCK_ECHO_BIND must parse as IP");
+    SocketAddr::new(ip, port)
+}
+
+fn key_path() -> PathBuf {
+    std::env::var_os("BEDROCK_ECHO_KEY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/var/lib/bedrock-echo/witness.x25519.key"))
+}
+
+fn main() {
+    let bind = parse_bind();
+    let key_path = key_path();
+    let priv_key = load_or_generate_priv(&key_path);
+    let mut state = State::new(priv_key, now_ms());
+
+    eprintln!("bedrock-echo-witness v{} starting", env!("CARGO_PKG_VERSION"));
+    eprintln!("  bind:           {}", bind);
+    eprintln!("  keyfile:        {}", key_path.display());
+    eprintln!("  witness pub:    {}", hex_encode(&state.witness_pub));
+    eprintln!("  witness senderid: {}", hex_encode(&state.witness_sender_id));
+
+    let sock = UdpSocket::bind(bind).expect("bind UDP socket");
+    let mut buf = [0u8; MTU_CAP + 64];
+    loop {
+        match sock.recv_from(&mut buf) {
+            Ok((len, src)) => {
+                let ipv4 = match src.ip() {
+                    IpAddr::V4(v4) => v4.octets(),
+                    IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                        Some(v4) => v4.octets(),
+                        None => {
+                            eprintln!("dropping v6 packet from {}: v6-only not in v1", src);
+                            continue;
+                        }
+                    },
+                };
+                if let Some(reply) = handle(&mut state, &buf[..len], ipv4, now_ms()) {
+                    if let Err(e) = sock.send_to(reply.as_slice(), src) {
+                        eprintln!("sendto {}: {}", src, e);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("recvfrom error: {}", e);
+            }
+        }
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
+}

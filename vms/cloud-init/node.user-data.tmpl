@@ -1,0 +1,77 @@
+#cloud-config
+hostname: {HOSTNAME}
+fqdn: {HOSTNAME}.bedrock-echo.local
+manage_etc_hosts: true
+
+users:
+  - name: root
+    lock_passwd: false
+    hashed_passwd: "{ROOT_PASSWD_HASH}"
+    ssh_authorized_keys:
+      - {SSH_PUBKEY}
+
+ssh_pwauth: true
+disable_root: false
+
+write_files:
+  - path: /etc/NetworkManager/system-connections/bedrock-drbd.nmconnection
+    permissions: '0600'
+    content: |
+      [connection]
+      id=bedrock-drbd
+      type=ethernet
+      interface-name=eth1
+      autoconnect=true
+      [ipv4]
+      method=manual
+      addresses={DRBD_IP}/24
+      # may-fail=true so NetworkManager-wait-online doesn't block boot
+      # on these static connections (no default route here).
+      may-fail=true
+      dns-search=
+      [ipv6]
+      method=disabled
+
+  - path: /etc/NetworkManager/system-connections/bec-link2.nmconnection
+    permissions: '0600'
+    content: |
+      [connection]
+      id=bec-link2
+      type=ethernet
+      interface-name=eth2
+      autoconnect=true
+      [ipv4]
+      method=manual
+      addresses={LINK2_IP}/24
+      may-fail=true
+      dns-search=
+      [ipv6]
+      method=disabled
+
+  - path: /etc/hosts
+    append: true
+    content: |
+      # Bedrock Echo pilot nodes
+{HOSTS_ENTRIES}
+
+  - path: /etc/motd
+    content: |
+      Bedrock Echo node VM: {HOSTNAME}
+      DRBD ring A  (primary drbd path): {DRBD_IP} on eth1
+      Link2 ring   (second drbd path):  {LINK2_IP} on eth2
+
+runcmd:
+  - nmcli con delete "Wired connection 1" 2>/dev/null || true
+  - nmcli con delete "Wired connection 2" 2>/dev/null || true
+  - systemctl restart NetworkManager
+  - sleep 2
+  - nmcli con up bedrock-drbd || true
+  - nmcli con up bec-link2 || true
+  - setenforce 0 || true
+  - sed -i 's/^SELINUX=.*/SELINUX=permissive/' /etc/selinux/config
+  - systemctl disable --now firewalld 2>/dev/null || true
+  - dnf install -y epel-release 2>&1 | tail -20 || true
+  - dnf install -y https://www.elrepo.org/elrepo-release-9.el9.elrepo.noarch.rpm 2>&1 | tail -20 || true
+  - dnf install -y kmod-drbd9x drbd9x-utils lvm2 python3 python3-cryptography 2>&1 | tail -20 || true
+  - modprobe drbd || true
+  - echo "drbd" > /etc/modules-load.d/drbd.conf

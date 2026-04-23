@@ -1,0 +1,14 @@
+{
+  "description": "STATUS_DETAIL for peer B, found",
+  "msg_type": "0x03 STATUS_DETAIL",
+  "cluster_key": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+  "witness_sender_id": "ee11ee22ee33ee44",
+  "sequence": 2,
+  "timestamp_ms": 1700000000000,
+  "witness_uptime_ms": 60000,
+  "target_sender_id": "bb11bb22bb33bb44",
+  "status": 0,
+  "peer_ipv4": "192.168.2.11",
+  "last_seen_seconds": 3,
+  "peer_payload": "726f6c653d7365636f6e646172792c636f6e6e3d436f6e6e65637465642c6469736b3d5570546f446174652c757569643d307866656564"
+}

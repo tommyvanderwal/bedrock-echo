@@ -1,0 +1,27 @@
+# Rust build output
+/target/
+
+# VM runtime state — disk images, cloud-init seeds containing injected
+# SSH pubkey, DRBD metadata. Large + contains instance-specific data.
+/vms/state/
+
+# Python bytecode and cache
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# User-local Claude Code settings (not part of the project)
+/.claude/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Local log files from harness runs
+/tmp/harness-*.log
+/harness/*.log

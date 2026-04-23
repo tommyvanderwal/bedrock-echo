@@ -1,0 +1,54 @@
+#cloud-config
+hostname: {HOSTNAME}
+fqdn: {HOSTNAME}.bedrock-echo.local
+manage_etc_hosts: true
+
+users:
+  - name: root
+    lock_passwd: false
+    hashed_passwd: "{ROOT_PASSWD_HASH}"
+    ssh_authorized_keys:
+      - {SSH_PUBKEY}
+
+ssh_pwauth: true
+disable_root: false
+
+write_files:
+  - path: /etc/motd
+    content: |
+      Bedrock Echo witness VM: {HOSTNAME}
+      Rust witness binary expected at /usr/local/bin/bedrock-echo-witness
+      Keyfile: /var/lib/bedrock-echo/witness.x25519.key
+      Start with: systemctl start bedrock-echo-witness
+
+  - path: /etc/systemd/system/bedrock-echo-witness.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Bedrock Echo witness (UDP/BEW1)
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=simple
+      ExecStart=/usr/local/bin/bedrock-echo-witness
+      Environment=BEDROCK_ECHO_BIND=0.0.0.0
+      Environment=BEDROCK_ECHO_PORT=7337
+      Environment=BEDROCK_ECHO_KEY=/var/lib/bedrock-echo/witness.x25519.key
+      Restart=always
+      RestartSec=3s
+      # RAM-only state by design — a reboot resets everything.
+      StateDirectory=bedrock-echo
+      StateDirectoryMode=0700
+      ProtectSystem=strict
+      ProtectHome=true
+      NoNewPrivileges=true
+
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  - setenforce 0 || true
+  - sed -i 's/^SELINUX=.*/SELINUX=permissive/' /etc/selinux/config
+  - systemctl disable --now firewalld 2>/dev/null || true
+  - mkdir -p /var/lib/bedrock-echo

@@ -1,0 +1,20 @@
+# Bedrock Echo v0.001 canonical test vectors
+# Each pair of files below must be parsed identically by every impl.
+01_heartbeat_list_query.in.json
+01_heartbeat_list_query.out.bin
+02_heartbeat_detail_query.in.json
+02_heartbeat_detail_query.out.bin
+03_status_list_two_nodes.in.json
+03_status_list_two_nodes.out.bin
+04_status_detail_found.in.json
+04_status_detail_found.out.bin
+05_status_detail_not_found.in.json
+05_status_detail_not_found.out.bin
+06_unknown_source.in.json
+06_unknown_source.out.bin
+07_bootstrap.in.json
+07_bootstrap.out.bin
+08_bootstrap_ack_new.in.json
+08_bootstrap_ack_new.out.bin
+09_bootstrap_ack_rebootstrap.in.json
+09_bootstrap_ack_rebootstrap.out.bin

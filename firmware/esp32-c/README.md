@@ -96,12 +96,68 @@ bew1: witness ready.
   power-cycle): nodes see UNKNOWN_SOURCE → auto-rebootstrap → back in
   normal operation within ~10 seconds. Invariant held throughout.
 
-## Binary size
+## Footprint (flash + RAM)
 
-```
-Total image: ~306 KB (including bootloader + partition table)
-  Free flash: 4 MB - ~310 KB = ~3.7 MB unused
-  Free RAM:   ~350 KB (IRAM + DRAM, mostly heap headroom)
-```
+### On-disk image (what gets flashed)
 
-Well within headroom for ESP32. No optimisations beyond `-Os`; no LTO yet.
+| Partition           | Size        | Notes                               |
+|---------------------|-------------|-------------------------------------|
+| bootloader.bin      | 25 KB       | 2nd-stage bootloader (IDF default)  |
+| partition-table.bin | 3 KB        | from `partitions.csv`               |
+| bedrock-echo-witness.bin | **279 KB** | app (code + rodata + IRAM image) |
+| NVS (data)          | 24 KB alloc | holds the X25519 privkey (32 B used)|
+| **Total on flash**  | **~307 KB** | **7.5 % of 4 MB, ~3.7 MB free**     |
+
+### RAM at runtime (post-boot, idle)
+
+| Region    | Used     | Total   | Free    |
+|-----------|----------|---------|---------|
+| IRAM      | 48 KB    | 128 KB  | 80 KB   |
+| DRAM      | 32 KB    | 181 KB  | 149 KB  |
+| **Total** | **80 KB** | **309 KB** | **~229 KB** |
+
+About 20 KB of the DRAM is `libmain.a/.bss` — our `bew1_state_t` struct
+(64-node table + 32-cluster table + 128-IP rate bucket). Static, no heap.
+
+### Where the 279 KB goes (top archive contributions)
+
+| Component | Size | What it gives us |
+|---|---|---|
+| `liblwip.a` | **45 KB** | TCP/IP stack (DHCP, UDP, IP, ARP) |
+| `libc.a` (newlib) | **38 KB** | printf, malloc, memcpy, ... |
+| `libesp_app_format.a` | **27 KB** | mostly ELF-SHA256 + version strings in `.rodata` |
+| `libmbedcrypto.a` | **19 KB** | HMAC-SHA256, HKDF, ChaCha20-Poly1305 |
+| `libesp_eth.a` | **19 KB** | Ethernet MAC + PHY drivers (LAN8710A etc.) |
+| `libfreertos.a` | **16 KB** | FreeRTOS kernel |
+| `libesp_hw_support.a` | **16 KB** | clocks, sleep, low-level HW |
+| `libnvs_flash.a` | **12 KB** | NVS key-value store (for the X25519 privkey) |
+| `libesp_system.a` | **12 KB** | init, heap init, panic handler |
+| `libspi_flash.a` | **11 KB** | SPI flash driver |
+| `libhal.a` | **10 KB** | hardware abstraction layer |
+| `libheap.a` | **9 KB** | heap allocator (tlsf) |
+| `libesp_driver_uart.a` | **6 KB** | console UART |
+| everything else | ~40 KB | GPIO, VFS, netif, partition table, C++ runtime stubs, etc. |
+| **`libmain.a` (our code)** | **28 KB total** | of which: **7.5 KB of `.text` (actual code)** + 20 KB of `.bss` (state tables) + 338 B of `.rodata` (log strings) |
+
+Our Bedrock Echo implementation is **7.5 KB of compiled code**. The rest is
+ESP-IDF infrastructure — the price of using LwIP+FreeRTOS+mbedTLS for a
+battle-tested platform rather than rolling our own TCP/IP and RTOS.
+
+### If smaller matters later
+
+Low-hanging 100+ KB reductions available but not done for v0.001:
+
+- Drop printf (`CONFIG_NEWLIB_NANO_FORMAT=y`) → saves ~15 KB of newlib.
+- Prune mbedTLS to only HMAC-SHA256 + ChaCha20-Poly1305 (disable AES,
+  ECDSA, X.509, TLS, etc.) → saves ~10-15 KB.
+- Minimal LwIP build (no TCP, no DNS, no ICMP responder, static IP
+  instead of DHCP) → saves ~20 KB.
+- `-Oz` instead of `-Os`, LTO → maybe ~10 KB.
+- Custom (no-newlib) linker if you're masochistic → another ~20 KB.
+
+Realistic floor for a C-on-ESP-IDF build with Ethernet + UDP + the crypto
+this protocol needs: **~150 KB**. That's 2/3rds smaller but still a
+multiple of our actual protocol code.
+
+On a 4 MB flash board, 279 KB is nothing. Optimise only if moving to a
+smaller chip (ESP32-C3 with 2 MB flash, for instance).

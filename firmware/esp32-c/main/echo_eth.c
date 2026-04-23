@@ -6,7 +6,7 @@
 // an external pull-down to keep it LOW at reset — we only drive it HIGH
 // *after* boot, which is safe.
 
-#include "bew1_eth.h"
+#include "echo_eth.h"
 
 #include <string.h>
 
@@ -18,7 +18,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-static const char *TAG = "bew1-eth";
+static const char *TAG = "echo-eth";
 
 #define OLIMEX_POE_ISO_PHY_ADDR      0
 #define OLIMEX_POE_ISO_PHY_POWER_PIN 12
@@ -28,7 +28,7 @@ static const char *TAG = "bew1-eth";
 static esp_eth_handle_t s_eth_handle = NULL;
 static esp_netif_t *s_eth_netif = NULL;
 
-esp_err_t bew1_eth_init(esp_netif_t **out_netif) {
+esp_err_t echo_eth_init(esp_netif_t **out_netif) {
     // 1. Power up the PHY before anything else touches the EMAC.
     gpio_config_t pwr = {
         .pin_bit_mask = 1ULL << OLIMEX_POE_ISO_PHY_POWER_PIN,

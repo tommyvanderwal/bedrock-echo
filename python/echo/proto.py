@@ -4,7 +4,7 @@ See PROTOCOL.md for the authoritative spec. Constants and layouts match
 that document byte-for-byte. Every function is pure: no I/O, no time.
 
 Sizes and structure:
-  header    = 32 bytes (magic | msg_type | flags | sender_id | sequence |
+  header    = 32 bytes (magic | msg_type | reserved | sender_id | sequence |
                         timestamp_ms | payload_len)
   payload   = payload_len bytes
   trailer   = 32-byte HMAC (0x01/0x02/0x03/0x21) or nothing (0x10/0x20)
@@ -18,7 +18,7 @@ from typing import ClassVar
 
 from . import crypto
 
-MAGIC = b"BEW1"
+MAGIC = b"Echo"
 HEADER_LEN = 32
 HMAC_LEN = 32
 MTU_CAP = 1400
@@ -53,7 +53,7 @@ BOOTSTRAP_INIT_PAYLOAD_MAX = 96
 
 
 class ProtocolError(Exception):
-    """Any structural / length / magic / flags violation. Caller should
+    """Any structural / length / magic / reserved violation. Caller should
     silently drop the packet that caused this (see PROTOCOL.md §12)."""
 
 
@@ -67,20 +67,20 @@ class AuthError(Exception):
 @dataclass(frozen=True)
 class Header:
     msg_type: int
-    flags: int
+    reserved: int
     sender_id: bytes        # 8 bytes
     sequence: int
     timestamp_ms: int
     payload_len: int
 
     _STRUCT: ClassVar[struct.Struct] = struct.Struct(">4sBB8sQqH")
-    # fields: magic | msg_type | flags | sender_id | sequence | timestamp_ms | payload_len
+    # fields: magic | msg_type | reserved | sender_id | sequence | timestamp_ms | payload_len
 
     def pack(self) -> bytes:
         return self._STRUCT.pack(
             MAGIC,
             self.msg_type & 0xFF,
-            self.flags & 0xFF,
+            self.reserved & 0xFF,
             self.sender_id,
             self.sequence & 0xFFFFFFFFFFFFFFFF,
             self.timestamp_ms,
@@ -91,17 +91,17 @@ class Header:
     def unpack(cls, buf: bytes) -> "Header":
         if len(buf) < HEADER_LEN:
             raise ProtocolError(f"short header: {len(buf)} < {HEADER_LEN}")
-        magic, mt, flags, sid, seq, ts, pl = cls._STRUCT.unpack_from(buf, 0)
+        magic, mt, reserved, sid, seq, ts, pl = cls._STRUCT.unpack_from(buf, 0)
         if magic != MAGIC:
             raise ProtocolError(f"bad magic: {magic!r}")
-        if flags != 0x00:
-            raise ProtocolError(f"nonzero flags: {flags:#x}")
+        if reserved != 0x00:
+            raise ProtocolError(f"nonzero reserved: {reserved:#x}")
         if mt not in ALL_MSG_TYPES:
             raise ProtocolError(f"unknown msg_type: {mt:#x}")
         if len(sid) != 8:
             raise ProtocolError("sender_id not 8 bytes")
         return cls(
-            msg_type=mt, flags=flags, sender_id=bytes(sid),
+            msg_type=mt, reserved=reserved, sender_id=bytes(sid),
             sequence=seq, timestamp_ms=ts, payload_len=pl,
         )
 

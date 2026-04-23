@@ -407,7 +407,7 @@ def _default_witness_sender_id(pub: bytes) -> bytes:
 
 
 def run_forever(witness: Witness, bind: str = "0.0.0.0",
-                port: int = 7337) -> None:
+                port: int = 12321) -> None:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((bind, port))
     log.info("witness listening on %s:%d (pub=%s)",

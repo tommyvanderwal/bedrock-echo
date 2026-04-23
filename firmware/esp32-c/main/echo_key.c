@@ -9,7 +9,7 @@
 // pseudo-random per Espressif's docs. The RF front-end is turned back
 // off immediately after — the witness itself never uses WiFi/BT.
 
-#include "bew1.h"
+#include "echo.h"
 
 #include <string.h>
 
@@ -22,8 +22,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-static const char *TAG = "bew1-key";
-#define NS "bew1"
+static const char *TAG = "echo-key";
+#define NS "echo"
 #define KEY "x25519priv"
 
 // Collect entropy from the RF-seeded hardware RNG over a long window and
@@ -52,7 +52,7 @@ static void collect_entropy(uint8_t out[32]) {
     mbedtls_sha256_free(&ctx);
 }
 
-int bew1_key_load_or_generate(uint8_t out[32]) {
+int echo_key_load_or_generate(uint8_t out[32]) {
     // Ensure NVS is initialised (caller should also do this at boot, but idempotent).
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -99,7 +99,7 @@ int bew1_key_load_or_generate(uint8_t out[32]) {
     out[31] |= 64;
 
     uint8_t pub[32];
-    if (!bew1_x25519_pub_from_priv(out, pub)) {
+    if (!echo_x25519_pub_from_priv(out, pub)) {
         ESP_LOGE(TAG, "x25519 pub_from_priv failed");
         nvs_close(h);
         return -1;

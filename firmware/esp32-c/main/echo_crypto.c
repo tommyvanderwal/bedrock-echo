@@ -7,7 +7,7 @@
 //   test vectors byte-for-byte on any target.
 // * HMAC-SHA256, HKDF-SHA256, ChaCha20-Poly1305: mbedTLS (already in IDF).
 
-#include "bew1.h"
+#include "echo.h"
 
 #include <string.h>
 
@@ -19,11 +19,11 @@
 #include "mbedtls/md.h"
 #include "mbedtls/sha256.h"
 
-static const char *CRYPTO_TAG = "bew1-crypto";
+static const char *CRYPTO_TAG = "echo-crypto";
 
 // ─── HMAC-SHA256 ────────────────────────────────────────────────────────────
 
-void bew1_hmac_sha256(const uint8_t *key, size_t key_len,
+void echo_hmac_sha256(const uint8_t *key, size_t key_len,
                       const uint8_t *data, size_t data_len,
                       uint8_t tag_out[32]) {
     const mbedtls_md_info_t *md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
@@ -37,11 +37,11 @@ void bew1_hmac_sha256(const uint8_t *key, size_t key_len,
     mbedtls_md_free(&ctx);
 }
 
-bool bew1_hmac_verify(const uint8_t *key, size_t key_len,
+bool echo_hmac_verify(const uint8_t *key, size_t key_len,
                       const uint8_t *data, size_t data_len,
                       const uint8_t tag[32]) {
     uint8_t computed[32];
-    bew1_hmac_sha256(key, key_len, data, data_len, computed);
+    echo_hmac_sha256(key, key_len, data, data_len, computed);
     return mbedtls_ct_memcmp(computed, tag, 32) == 0;
 }
 
@@ -183,16 +183,16 @@ static int tweetnacl_scalarmult(uint8_t *q, const uint8_t *n, const uint8_t *p) 
 
 static const uint8_t CURVE25519_BASE[32] = {9, 0};  // rest is zero
 
-bool bew1_x25519_pub_from_priv(const uint8_t priv[32], uint8_t pub_out[32]) {
+bool echo_x25519_pub_from_priv(const uint8_t priv[32], uint8_t pub_out[32]) {
     return tweetnacl_scalarmult(pub_out, priv, CURVE25519_BASE) == 0;
 }
 
-bool bew1_x25519_shared(const uint8_t priv[32], const uint8_t peer_pub[32],
+bool echo_x25519_shared(const uint8_t priv[32], const uint8_t peer_pub[32],
                         uint8_t shared_out[32]) {
     return tweetnacl_scalarmult(shared_out, priv, peer_pub) == 0;
 }
 
-bool bew1_x25519_generate(uint8_t priv_out[32], uint8_t pub_out[32]) {
+bool echo_x25519_generate(uint8_t priv_out[32], uint8_t pub_out[32]) {
     // ESP32 has a hardware RNG exposed via esp_fill_random() — better
     // entropy source than mbedTLS's DRBD when Wi-Fi/BT are off (no phy init).
     esp_fill_random(priv_out, 32);
@@ -202,7 +202,7 @@ bool bew1_x25519_generate(uint8_t priv_out[32], uint8_t pub_out[32]) {
     priv_out[31] &= 127;
     priv_out[31] |= 64;
 
-    if (!bew1_x25519_pub_from_priv(priv_out, pub_out)) {
+    if (!echo_x25519_pub_from_priv(priv_out, pub_out)) {
         ESP_LOGE(CRYPTO_TAG, "x25519_pub_from_priv failed");
         return false;
     }
@@ -211,17 +211,17 @@ bool bew1_x25519_generate(uint8_t priv_out[32], uint8_t pub_out[32]) {
 
 // ─── HKDF-SHA256 ────────────────────────────────────────────────────────────
 
-bool bew1_hkdf_sha256(const uint8_t *ikm, size_t ikm_len, uint8_t out[32]) {
+bool echo_hkdf_sha256(const uint8_t *ikm, size_t ikm_len, uint8_t out[32]) {
     const mbedtls_md_info_t *md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
     static const uint8_t salt[32] = {0};  // all-zero 32-byte salt per spec
     return mbedtls_hkdf(md, salt, 32, ikm, ikm_len,
-                        BEW1_HKDF_INFO, BEW1_HKDF_INFO_LEN,
+                        ECHO_HKDF_INFO, ECHO_HKDF_INFO_LEN,
                         out, 32) == 0;
 }
 
 // ─── ChaCha20-Poly1305 ──────────────────────────────────────────────────────
 
-bool bew1_aead_encrypt(const uint8_t key[32],
+bool echo_aead_encrypt(const uint8_t key[32],
                        const uint8_t *aad, size_t aad_len,
                        const uint8_t *pt, size_t pt_len,
                        uint8_t *out) {
@@ -240,7 +240,7 @@ out:
     return ok;
 }
 
-bool bew1_aead_decrypt(const uint8_t key[32],
+bool echo_aead_decrypt(const uint8_t key[32],
                        const uint8_t *aad, size_t aad_len,
                        const uint8_t *ct, size_t ct_len,
                        uint8_t *out) {

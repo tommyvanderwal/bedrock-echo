@@ -25,10 +25,10 @@ pub enum Error {
     TooShort,
     /// Total length doesn't match msg_type + payload_len + trailer
     BadLength,
-    /// magic != "BEW1"
+    /// magic != "Echo"
     BadMagic,
-    /// flags != 0
-    BadFlags,
+    /// reserved != 0
+    BadReserved,
     /// unknown msg_type
     BadMsgType,
     /// sender_id == 0 from a node

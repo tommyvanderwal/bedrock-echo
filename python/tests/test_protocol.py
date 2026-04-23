@@ -174,10 +174,10 @@ def test_sender_id_zero_rejected():
         ).encode(CK)
 
 
-def test_nonzero_flags_rejected_on_decode():
+def test_nonzero_reserved_byte_rejected_on_decode():
     hb = proto.Heartbeat(SID, 1, 0, b"\x00" * 8, b"")
     wire = bytearray(hb.encode(CK))
-    wire[5] = 0x01  # flags
+    wire[5] = 0x01  # reserved byte must be 0x00 per spec
     wire[-32:] = crypto.hmac_sha256(CK, bytes(wire[:-32]))
     with pytest.raises(proto.ProtocolError):
         proto.decode_heartbeat(bytes(wire), CK)

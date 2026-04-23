@@ -1,13 +1,13 @@
 # Bedrock Echo witness — ESP32-POE-ISO firmware (C / ESP-IDF)
 
-Third reference implementation of the BEW1 protocol, alongside the Rust
+Third reference implementation of the Echo protocol, alongside the Rust
 witness and the Python reference. Targets the **Olimex ESP32-POE-ISO**
 (ESP32 + LAN8710A Ethernet PHY over RMII with 50 MHz ref clock generated
 by the ESP32's APLL on GPIO17).
 
 ## What this ports across
 
-The BEW1 protocol is defined byte-for-byte in `PROTOCOL.md` at the repo
+The Echo protocol is defined byte-for-byte in `PROTOCOL.md` at the repo
 root, with checked-in test vectors in `testvectors/`. The C impl here
 reuses those vectors for interop validation: encode + decode match the
 Python/Rust impls exactly.
@@ -21,13 +21,13 @@ firmware/esp32-c/
 ├── partitions.csv          # 1.5 MB app, 24 KB NVS for the X25519 private key
 └── main/
     ├── CMakeLists.txt
-    ├── bew1.h              # public types + constants (mirrors PROTOCOL.md)
-    ├── bew1_crypto.c       # TweetNaCl X25519 + mbedTLS HMAC/HKDF/ChaChaPoly
-    ├── bew1_proto.c        # encode/decode for all 6 msg types (BE, no bitfields)
-    ├── bew1_state.c        # RAM-only state tables, age-out, token-bucket RL
-    ├── bew1_handler.c      # dispatcher — the core of §9
-    ├── bew1_eth.c          # Olimex POE-ISO Ethernet bring-up
-    ├── bew1_key.c          # NVS load-or-generate of the X25519 private key
+    ├── echo.h              # public types + constants (mirrors PROTOCOL.md)
+    ├── echo_crypto.c       # TweetNaCl X25519 + mbedTLS HMAC/HKDF/ChaChaPoly
+    ├── echo_proto.c        # encode/decode for all 6 msg types (BE, no bitfields)
+    ├── echo_state.c        # RAM-only state tables, age-out, token-bucket RL
+    ├── echo_handler.c      # dispatcher — the core of §9
+    ├── echo_eth.c          # Olimex POE-ISO Ethernet bring-up
+    ├── echo_key.c          # NVS load-or-generate of the X25519 private key
     └── main.c              # init, event loop, UDP task
 ```
 
@@ -92,7 +92,7 @@ pub=402436752456a377141b9e97a6338538eaa1aa249f3d8a233c5e4526a3134636
 senderid=3c69ecacc9db06bb
 mac=ec:c9:ff:b8:69:f7
 ip=192.168.2.181
-port=7337
+port=12321
 ===END===
 ```
 
@@ -103,7 +103,7 @@ A node provisioning script can just:
 echo '' > /dev/ttyUSB0
 cat /dev/ttyUSB0 | sed -n '/===BEDROCK-ECHO-WITNESS===/,/===END===/p' \
     | awk -F= '/^[a-z]/ {print $1"="$2}'
-# → pub=...  senderid=...  mac=...  ip=...  port=7337
+# → pub=...  senderid=...  mac=...  ip=...  port=12321
 ```
 
 Whenever DHCP assigns or renews the Ethernet interface's IP, the
@@ -173,7 +173,7 @@ or otherwise exposes the X25519 private key after it's written to NVS.
 | DRAM      | 32 KB    | 181 KB  | 149 KB  |
 | **Total** | **80 KB** | **309 KB** | **~229 KB** |
 
-About 20 KB of the DRAM is `libmain.a/.bss` — our `bew1_state_t` struct
+About 20 KB of the DRAM is `libmain.a/.bss` — our `echo_state_t` struct
 (64-node table + 32-cluster table + 128-IP rate bucket). Static, no heap.
 
 ### Where the 279 KB goes (top archive contributions)

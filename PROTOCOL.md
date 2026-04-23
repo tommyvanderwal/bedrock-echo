@@ -1,12 +1,15 @@
-# Bedrock Echo Protocol — v0.002 (DRAFT)
+# Bedrock Echo Protocol — v1.0
 
-**Status:** Draft for review. Once frozen, this spec is the contract between
-all implementations. Changes require a version bump.
+**Status:** Frozen. Once implementations start shipping on firmware that goes
+into boxes we will never touch again, changes to this spec are forbidden. A
+genuinely different protocol ships on a different UDP port, not a new version.
 
-**Transport:** UDP, default port 7337 (configurable; not part of the protocol).
+**Transport:** UDP, default port **12321** (configurable by deployment; the
+port number is not part of the protocol itself).
 **One message = one UDP datagram.** Every message fits in a single datagram
 under typical Ethernet MTU (≤1400 B). The protocol has no fragmentation and no
-streaming; if a deployment needs more, that's a v0.2 conversation.
+streaming; a deployment needing more uses a different UDP port for a different
+protocol.
 
 ---
 
@@ -20,17 +23,22 @@ streaming; if a deployment needs more, that's a v0.2 conversation.
    `uint32` ms or `uint32` seconds.
 5. **Every datagram ≤ 1400 bytes** — under Ethernet UDP MTU with margin. No IP
    fragmentation ever.
-6. **Strict parsing.** Wrong magic, flags, length, HMAC, or AEAD tag = silent
-   drop. No lenient mode, no partial parse, no "ignore unknown fields".
-7. **Version is in the magic.** `BEW1` = v1. v2 will use `BEW2` and dual-stack
-   impls MUST dispatch by the first 4 bytes.
-8. **Crypto primitives are the common-denominator set:** X25519, HKDF-SHA256,
+6. **Strict parsing.** Wrong magic, non-zero reserved byte, bad length, bad
+   HMAC, or bad AEAD tag = silent drop. No lenient mode, no partial parse,
+   no "ignore unknown fields".
+7. **No protocol version field.** The magic is `Echo`, forever. If a
+   genuinely different protocol is needed later, it ships on a different UDP
+   port — not as a version bump over this one. This avoids the "old firmware
+   in the wild breaking when we upgrade" failure mode.
+8. **`msg_type` is the extension point.** 256 values, 6 used today. Unknown
+   msg_type → silent drop, so old implementations forward-compat by design.
+9. **Crypto primitives are the common-denominator set:** X25519, HKDF-SHA256,
    HMAC-SHA256, ChaCha20-Poly1305. Available in every major language's standard
-   crypto lib and on ESP32 mbedTLS. **No Ed25519 in v1** — possession of the
-   X25519 private key proved by successful ECDH is the witness's identity.
-9. **No cluster_id on the wire.** The cluster is defined by its shared HMAC
-   key. Witness looks up `sender_id → cluster` once per node and caches.
-10. **No fragmentation.** STATUS comes in two flavours — a compact list (all
+   crypto lib and on ESP32 mbedTLS. **No Ed25519** — possession of the X25519
+   private key proved by successful ECDH is the witness's identity.
+10. **No cluster_id on the wire.** The cluster is defined by its shared HMAC
+    key. Witness looks up `sender_id → cluster` once per node and caches.
+11. **No fragmentation.** STATUS comes in two flavours — a compact list (all
     nodes, 64 fit easily) or a single-peer detail (full 128 B payload). Node
     picks which reply it wants per heartbeat.
 
@@ -43,9 +51,9 @@ Every Bedrock Echo packet starts with the same **32-byte header**:
 ```
 Offset  Size  Name          Type    Description
 ────────────────────────────────────────────────────────────────────────────
-0       4     magic         bytes   "BEW1"  = 0x42 0x45 0x57 0x31
+0       4     magic         bytes   "Echo"  = 0x45 0x63 0x68 0x6f
 4       1     msg_type      u8      see §3
-5       1     flags         u8      reserved, MUST be 0x00 in v1
+5       1     reserved      u8      MUST be 0x00 (strict); see §1 principle 8
 6       8     sender_id     bytes   64-bit stable node identifier
                                     (0x0000000000000000 is reserved/invalid
                                     for node senders; the witness MAY use it
@@ -62,8 +70,8 @@ payload comes the **trailer** (HMAC tag or nothing, per message type).
 
 Every implementation MUST reject (silently drop) any packet where:
 - total UDP length < 32 (can't even hold the header)
-- `magic` ≠ `"BEW1"`
-- `flags` ≠ `0x00`
+- `magic` ≠ `"Echo"`
+- `reserved` ≠ `0x00`
 - total UDP length ≠ `32 + payload_len + trailer_len(msg_type)`
 - `sender_id == 0x0000000000000000` in a message from a node
 - total UDP length > 1400 (MTU cap)
@@ -463,7 +471,7 @@ for small LANs. Upstream firewalling is expected in production.
 
 Silently drop any packet that:
 
-1. Has wrong magic, wrong flags, wrong msg_type, or declared length doesn't
+1. Has wrong magic, non-zero reserved byte, wrong msg_type, or declared length doesn't
    match UDP length.
 2. Exceeds MTU cap (1400 B).
 3. Has `sender_id == 0` in a node→witness message.
@@ -610,25 +618,34 @@ For the KVM pilot: `SHA256(vNIC_MAC || VM_name)[0..8]`.
 
 ---
 
-## 17. Versioning and compatibility
+## 17. Compatibility and extension
 
-- The `magic` field is the sole version indicator. `BEW1` = v1.
-- Future versions use a different magic (`BEW2`, `BEW3`, ...).
-- A v2 impl that wants to interop with v1 MUST implement both magics and
-  dispatch by the first 4 bytes.
-- No negotiation. Sender picks a version; receiver either speaks it or
-  silently drops.
+**No protocol version field, intentionally.** The magic bytes `Echo` are the
+permanent protocol identifier. Any change to the wire format that would
+break existing implementations is, by definition, a different protocol and
+ships on a different UDP port (and, if a public thing, a different name).
 
----
+Forward-compatible extensions happen through the `msg_type` byte. 256
+values exist; 6 are used (0x01, 0x02, 0x03, 0x10, 0x20, 0x21). New
+`msg_type` values can be added at any time:
 
-## 18. v0.2 roadmap (not this version)
+- Old implementations that don't recognise a new `msg_type` silently drop
+  it (per §12 rule 1). No crashes, no partial parses.
+- New implementations that rely on a new `msg_type` MUST degrade gracefully
+  when the peer doesn't understand it (e.g., fall back to HEARTBEAT with
+  `query_target_id = 0`).
 
-- IPv6 node addresses (new STATUS_LIST entry format or new `msg_type`).
-- 3-witness / 5-witness majority mode (witnesses unchanged, node quorum logic
-  extended).
-- Explicit `ROTATE_KEY` message for cluster-key rotation without full
-  re-bootstrap.
-- Ed25519-signed witness replies for third-party verifiability.
-- Multicast witness discovery (so nodes don't need IP configured).
+Candidate future `msg_type` values (reserved numeric ranges, not yet
+specified):
+
+- `0x04-0x0f`: future node-query message variants.
+- `0x11-0x1f`: future unauthenticated witness replies (companions to
+  `UNKNOWN_SOURCE`).
+- `0x22-0x2f`: future bootstrap-related messages.
+- `0x30+`: cluster-management extensions.
+
+No specific extension is committed to here. Extensions are added only when
+a concrete need in a deployed system proves they are worth fracturing the
+currently-simple spec.
 
 ---

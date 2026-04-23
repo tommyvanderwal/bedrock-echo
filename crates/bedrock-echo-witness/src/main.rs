@@ -55,7 +55,7 @@ fn load_or_generate_priv(path: &PathBuf) -> [u8; 32] {
 fn parse_bind() -> SocketAddr {
     let host = std::env::var("BEDROCK_ECHO_BIND").unwrap_or_else(|_| "0.0.0.0".into());
     let port: u16 = std::env::var("BEDROCK_ECHO_PORT").ok()
-        .and_then(|s| s.parse().ok()).unwrap_or(7337);
+        .and_then(|s| s.parse().ok()).unwrap_or(12321);
     let ip: IpAddr = host.parse().expect("BEDROCK_ECHO_BIND must parse as IP");
     SocketAddr::new(ip, port)
 }

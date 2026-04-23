@@ -1,10 +1,10 @@
 // Bedrock Echo witness — Olimex ESP32-POE-ISO firmware (ESP-IDF / C).
 // Boots, initialises Ethernet, loads (or generates) the witness X25519
-// private key, binds UDP 7337, and runs the protocol dispatcher.
+// private key, binds UDP 12321, and runs the protocol dispatcher.
 
-#include "bew1.h"
-#include "bew1_eth.h"
-#include "bew1_info.h"
+#include "echo.h"
+#include "echo_eth.h"
+#include "echo_info.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -22,12 +22,12 @@
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
 
-static const char *TAG = "bew1";
+static const char *TAG = "echo";
 
 #define GOT_IPV4_BIT BIT0
 static EventGroupHandle_t s_net_events;
 
-static bew1_state_t g_state;
+static echo_state_t g_state;
 
 static uint64_t now_ms(void) {
     return (uint64_t)(esp_timer_get_time() / 1000LL);
@@ -73,17 +73,17 @@ static void udp_server_task(void *arg) {
 
     struct sockaddr_in addr = {
         .sin_family = AF_INET,
-        .sin_port = htons(BEW1_UDP_PORT_DEFAULT),
+        .sin_port = htons(ECHO_UDP_PORT_DEFAULT),
         .sin_addr.s_addr = htonl(INADDR_ANY),
     };
     if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         ESP_LOGE(TAG, "bind(): errno=%d", errno);
         close(sock); vTaskDelete(NULL);
     }
-    ESP_LOGI(TAG, "listening on UDP 0.0.0.0:%u", BEW1_UDP_PORT_DEFAULT);
+    ESP_LOGI(TAG, "listening on UDP 0.0.0.0:%u", ECHO_UDP_PORT_DEFAULT);
 
-    static uint8_t rx_buf[BEW1_MTU_CAP + 64];
-    static uint8_t tx_buf[BEW1_MTU_CAP];
+    static uint8_t rx_buf[ECHO_MTU_CAP + 64];
+    static uint8_t tx_buf[ECHO_MTU_CAP];
 
     while (1) {
         struct sockaddr_in src;
@@ -99,7 +99,7 @@ static void udp_server_task(void *arg) {
         memcpy(src_ipv4, &src.sin_addr.s_addr, 4);
 
         size_t out_len = 0;
-        bool reply = bew1_handle_packet(&g_state, rx_buf, (size_t)n,
+        bool reply = echo_handle_packet(&g_state, rx_buf, (size_t)n,
                                          src_ipv4, now_ms(),
                                          tx_buf, sizeof(tx_buf), &out_len);
         if (reply && out_len > 0) {
@@ -113,7 +113,7 @@ void app_main(void) {
     ESP_LOGI(TAG, "======================================");
     ESP_LOGI(TAG, "  Bedrock Echo witness — ESP32 (C)    ");
     ESP_LOGI(TAG, "  Board: Olimex ESP32-POE-ISO         ");
-    ESP_LOGI(TAG, "  Protocol: BEW1 / UDP %u              ", BEW1_UDP_PORT_DEFAULT);
+    ESP_LOGI(TAG, "  Protocol: Echo / UDP %u              ", ECHO_UDP_PORT_DEFAULT);
     ESP_LOGI(TAG, "======================================");
 
     ESP_ERROR_CHECK(nvs_flash_init());
@@ -128,14 +128,14 @@ void app_main(void) {
 
     // 1. X25519 keypair — from NVS, or fresh on first boot.
     uint8_t priv[32];
-    int key_status = bew1_key_load_or_generate(priv);
+    int key_status = echo_key_load_or_generate(priv);
     if (key_status < 0) {
         ESP_LOGE(TAG, "cannot load or generate X25519 private key");
         return;
     }
 
     // 2. Initialise RAM-only witness state.
-    bew1_state_init(&g_state, priv, now_ms());
+    echo_state_init(&g_state, priv, now_ms());
     hex_dump("witness pub     ", g_state.witness_pub, 32);
     hex_dump("witness senderid", g_state.witness_sender_id, 8);
 
@@ -146,7 +146,7 @@ void app_main(void) {
         ESP_LOGW(TAG, "first-boot key generation complete — info block below, then reboot");
         // No netif yet, so `ip=` will show "(no DHCP yet)"; operator gets
         // pub + MAC on the serial console before the device joins the LAN.
-        bew1_info_print(&g_state, NULL);
+        echo_info_print(&g_state, NULL);
         ESP_LOGW(TAG, "rebooting for a clean steady-state boot ...");
         vTaskDelay(pdMS_TO_TICKS(500));  // give the UART time to drain
         esp_restart();
@@ -155,18 +155,18 @@ void app_main(void) {
 
     // 3. Ethernet up + DHCP.
     esp_netif_t *netif = NULL;
-    ESP_ERROR_CHECK(bew1_eth_init(&netif));
+    ESP_ERROR_CHECK(echo_eth_init(&netif));
 
     ESP_LOGI(TAG, "waiting for DHCP ...");
     xEventGroupWaitBits(s_net_events, GOT_IPV4_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
 
     // 4. UDP task.
-    xTaskCreate(udp_server_task, "bew1-udp", 8192, NULL, 5, NULL);
+    xTaskCreate(udp_server_task, "echo-udp", 8192, NULL, 5, NULL);
 
     ESP_LOGI(TAG, "witness ready.");
 
     // 5. Print the provisioning info block (pub / senderid / MAC / IP)
     //    and start a tiny console that re-prints it on any serial input.
-    bew1_info_print(&g_state, netif);
-    bew1_info_start_console(&g_state, netif);
+    echo_info_print(&g_state, netif);
+    echo_info_start_console(&g_state, netif);
 }

@@ -1,6 +1,6 @@
 //! Constants locked by PROTOCOL.md. Do not change without a version bump.
 
-pub const MAGIC: &[u8; 4] = b"BEW1";
+pub const MAGIC: &[u8; 4] = b"Echo";
 pub const HEADER_LEN: usize = 32;
 pub const HMAC_LEN: usize = 32;
 pub const MTU_CAP: usize = 1400;

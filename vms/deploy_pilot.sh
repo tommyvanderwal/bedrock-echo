@@ -67,7 +67,7 @@ PEER_NAME=$peer_name
 SENDER_ID_HEX=$sid
 PEER_SENDER_ID_HEX=$peer_sid
 CLUSTER_KEY_HEX=$CLUSTER_KEY
-WITNESS_ADDR=$WITNESS_IP:7337
+WITNESS_ADDR=$WITNESS_IP:12321
 WITNESS_X25519_PUB_HEX=$WITNESS_PUB
 PEER_MGMT_IP=$peer_mgmt
 PEER_DRBD_IP=$peer_drbd
@@ -104,7 +104,7 @@ deploy_node bec-node-b bec-node-a "$NODE_B_IP" "$NODE_A_IP" 10.99.0.20 10.88.0.2
 cat <<EOF
 
 === deployed ===
-witness:      $WITNESS_IP:7337
+witness:      $WITNESS_IP:12321
 witness_pub:  $WITNESS_PUB
 cluster_key:  $CLUSTER_KEY
 sid A:        $SID_A

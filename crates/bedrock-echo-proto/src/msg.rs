@@ -67,7 +67,7 @@ pub fn encode_heartbeat(
     if out.len() < total { return Err(Error::BadLength); }
 
     let hdr = Header {
-        msg_type: MSG_HEARTBEAT, flags: 0, sender_id,
+        msg_type: MSG_HEARTBEAT, reserved: 0, sender_id,
         sequence, timestamp_ms,
         payload_len: payload_len as u16,
     };
@@ -130,7 +130,7 @@ pub fn encode_status_list(
     if out.len() < total { return Err(Error::BadLength); }
 
     let hdr = Header {
-        msg_type: MSG_STATUS_LIST, flags: 0, sender_id,
+        msg_type: MSG_STATUS_LIST, reserved: 0, sender_id,
         sequence, timestamp_ms,
         payload_len: payload_len as u16,
     };
@@ -220,7 +220,7 @@ pub fn encode_status_detail_found(
     if total > MTU_CAP { return Err(Error::OverMtu); }
     if out.len() < total { return Err(Error::BadLength); }
     let hdr = Header {
-        msg_type: MSG_STATUS_DETAIL, flags: 0, sender_id,
+        msg_type: MSG_STATUS_DETAIL, reserved: 0, sender_id,
         sequence, timestamp_ms, payload_len: payload_len as u16,
     };
     hdr.pack(&mut out[..HEADER_LEN]);
@@ -250,7 +250,7 @@ pub fn encode_status_detail_not_found(
     let total = HEADER_LEN + payload_len + HMAC_LEN;
     if out.len() < total { return Err(Error::BadLength); }
     let hdr = Header {
-        msg_type: MSG_STATUS_DETAIL, flags: 0, sender_id,
+        msg_type: MSG_STATUS_DETAIL, reserved: 0, sender_id,
         sequence, timestamp_ms, payload_len: payload_len as u16,
     };
     hdr.pack(&mut out[..HEADER_LEN]);
@@ -334,7 +334,7 @@ pub fn encode_unknown_source(
 ) -> Result<usize> {
     if out.len() < HEADER_LEN { return Err(Error::BadLength); }
     let hdr = Header {
-        msg_type: MSG_UNKNOWN_SOURCE, flags: 0, sender_id,
+        msg_type: MSG_UNKNOWN_SOURCE, reserved: 0, sender_id,
         sequence, timestamp_ms, payload_len: 0,
     };
     hdr.pack(&mut out[..HEADER_LEN]);
@@ -370,7 +370,7 @@ pub fn encode_bootstrap(
     if out.len() < total { return Err(Error::BadLength); }
 
     let hdr = Header {
-        msg_type: MSG_BOOTSTRAP, flags: 0, sender_id,
+        msg_type: MSG_BOOTSTRAP, reserved: 0, sender_id,
         sequence, timestamp_ms, payload_len: payload_len as u16,
     };
     hdr.pack(&mut out[..HEADER_LEN]);
@@ -472,7 +472,7 @@ pub fn encode_bootstrap_ack(
     let total = HEADER_LEN + payload_len + HMAC_LEN;
     if out.len() < total { return Err(Error::BadLength); }
     let hdr = Header {
-        msg_type: MSG_BOOTSTRAP_ACK, flags: 0, sender_id,
+        msg_type: MSG_BOOTSTRAP_ACK, reserved: 0, sender_id,
         sequence, timestamp_ms, payload_len: payload_len as u16,
     };
     hdr.pack(&mut out[..HEADER_LEN]);

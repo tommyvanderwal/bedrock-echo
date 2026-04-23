@@ -4,7 +4,7 @@ if the BEDROCK_ECHO_WITNESS_ADDR env var isn't set.
 
 Usage (manual):
     # start the Rust binary somewhere, then:
-    BEDROCK_ECHO_WITNESS_ADDR=127.0.0.1:17337 \
+    BEDROCK_ECHO_WITNESS_ADDR=127.0.0.1:12321 \
     BEDROCK_ECHO_WITNESS_PUB=<hex-of-witness-pub> \
     PYTHONPATH=python python3 -m pytest python/tests/test_interop_live.py -v
 """

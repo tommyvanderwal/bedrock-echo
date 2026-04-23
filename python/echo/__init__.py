@@ -9,10 +9,10 @@ See PROTOCOL.md for the wire format. This package provides:
 from . import proto, crypto
 
 __all__ = ["proto", "crypto"]
-__version__ = "0.0.1"
+__version__ = "1.0.0"
 
-MAGIC = b"BEW1"
-DEFAULT_PORT = 7337
+MAGIC = b"Echo"
+DEFAULT_PORT = 12321
 MTU_CAP = 1400
 HEADER_LEN = 32
 HMAC_LEN = 32

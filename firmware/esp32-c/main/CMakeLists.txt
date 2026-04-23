@@ -1,13 +1,13 @@
 idf_component_register(
     SRCS
         "main.c"
-        "bew1_crypto.c"
-        "bew1_proto.c"
-        "bew1_state.c"
-        "bew1_handler.c"
-        "bew1_eth.c"
-        "bew1_info.c"
-        "bew1_key.c"
+        "echo_crypto.c"
+        "echo_proto.c"
+        "echo_state.c"
+        "echo_handler.c"
+        "echo_eth.c"
+        "echo_info.c"
+        "echo_key.c"
     INCLUDE_DIRS "."
     REQUIRES
         esp_eth

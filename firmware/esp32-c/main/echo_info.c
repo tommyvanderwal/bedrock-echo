@@ -1,7 +1,7 @@
 // Provisioning-facing serial info block. Deliberately tiny and machine-
 // parseable. No dependency on fancy console libs.
 
-#include "bew1_info.h"
+#include "echo_info.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -14,10 +14,10 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-static const char *TAG = "bew1-info";
+static const char *TAG = "echo-info";
 
 // Kept at file scope so the console task can re-print without threading args.
-static const bew1_state_t *s_state = NULL;
+static const echo_state_t *s_state = NULL;
 static esp_netif_t *s_eth_netif = NULL;
 
 static void hex_to(char *dst, const uint8_t *src, size_t n) {
@@ -29,7 +29,7 @@ static void hex_to(char *dst, const uint8_t *src, size_t n) {
     dst[2 * n] = 0;
 }
 
-void bew1_info_print(const bew1_state_t *state, esp_netif_t *eth_netif) {
+void echo_info_print(const echo_state_t *state, esp_netif_t *eth_netif) {
     char pub_hex[65], sid_hex[17];
     hex_to(pub_hex, state->witness_pub, 32);
     hex_to(sid_hex, state->witness_sender_id, 8);
@@ -55,7 +55,7 @@ void bew1_info_print(const bew1_state_t *state, esp_netif_t *eth_netif) {
     } else {
         printf("ip=(no DHCP yet)\n");
     }
-    printf("port=%u\n", BEW1_UDP_PORT_DEFAULT);
+    printf("port=%u\n", ECHO_UDP_PORT_DEFAULT);
     printf("===END===\n");
     printf("\n");
     fflush(stdout);
@@ -76,16 +76,16 @@ static void console_task(void *arg) {
             c = getchar();
             if (c == EOF) break;
         }
-        if (s_state) bew1_info_print(s_state, s_eth_netif);
+        if (s_state) echo_info_print(s_state, s_eth_netif);
     }
 }
 
-void bew1_info_start_console(const bew1_state_t *state, esp_netif_t *eth_netif) {
+void echo_info_start_console(const echo_state_t *state, esp_netif_t *eth_netif) {
     s_state = state;
     s_eth_netif = eth_netif;
     // stdin is line-buffered by default via VFS; switch to unbuffered so
     // we see bytes as soon as they arrive.
     setvbuf(stdin, NULL, _IONBF, 0);
-    xTaskCreate(console_task, "bew1-console", 3072, NULL, 3, NULL);
+    xTaskCreate(console_task, "echo-console", 3072, NULL, 3, NULL);
     ESP_LOGI(TAG, "serial console ready (press Enter for info block)");
 }

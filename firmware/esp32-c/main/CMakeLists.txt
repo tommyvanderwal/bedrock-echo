@@ -1,0 +1,21 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "bew1_crypto.c"
+        "bew1_proto.c"
+        "bew1_state.c"
+        "bew1_handler.c"
+        "bew1_eth.c"
+        "bew1_key.c"
+    INCLUDE_DIRS "."
+    REQUIRES
+        esp_eth
+        esp_netif
+        esp_event
+        nvs_flash
+        lwip
+        mbedtls
+        driver
+    PRIV_REQUIRES
+        esp_timer
+)

@@ -301,6 +301,16 @@ def scn_witness_reboot():
        check=False)
 
 
+def scn_esp32_witness_reboot():
+    """Hard-reset the ESP32 witness via esptool (simulates power-cycle).
+    Frees the port, resets via RTS, waits for boot + NVS key load + Eth up."""
+    sh(["bash", "-c", "fuser -k /dev/ttyUSB0 2>/dev/null; sleep 1"], check=False)
+    sh(["bash", "-c",
+        ". ~/esp/esp-idf/export.sh >/dev/null 2>&1 && "
+        "esptool.py --port /dev/ttyUSB0 --chip esp32 chip_id >/dev/null 2>&1"],
+       check=False, timeout=30)
+
+
 def scn_power_off_a():
     virsh("destroy", "bec-node-a")
 
@@ -328,6 +338,10 @@ SCENARIOS = [
     Scenario("witness-reboot",
              "Witness service restarts — nodes auto-rebootstrap, no promotion",
              scn_witness_reboot, expect_no_change=True),
+    Scenario("esp32-witness-reboot",
+             "Hardware-reset the ESP32 witness — nodes auto-rebootstrap, "
+             "no promotion (RAM-only state loss is harmless by design)",
+             scn_esp32_witness_reboot, expect_no_change=True),
     Scenario("daemon-restart-a",
              "Node A's daemon restarts — heartbeats blip briefly, no promotion",
              scn_node_daemon_restart_a, expect_no_change=True),

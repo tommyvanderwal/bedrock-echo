@@ -50,17 +50,18 @@ different protocol.
     use AEAD (ChaCha20-Poly1305) to provide both confidentiality and
     integrity. Only DISCOVER and INIT are unauthenticated — those are
     bootstrap-discovery messages and have no shared key.
-13. **No amplification.** Every unauthenticated request the witness will
-    reply to is sized **≥ the reply**. Specifically, DISCOVER (62 B,
-    zero-padded) → INIT (62 B). A spoofed-source DISCOVER cannot turn the
-    witness into a UDP amplifier — the reply is never larger than the
-    request.
-14. **Anti-spoofing via DNS-style cookies.** INIT carries a 16-byte
+13. **Anti-spoofing via DNS-style cookies.** INIT carries a 16-byte
     cookie bound to the requesting IP (`SHA-256(witness_cookie_secret ||
     src_ip)[:16]`). BOOTSTRAP MUST carry a valid cookie (current or
     previous secret). This proves the bootstrapper can actually receive
     packets at its claimed source IP, defeating off-path BOOTSTRAP
-    spoofing without any per-flow witness state.
+    spoofing without any per-flow witness state. Combined with strict
+    `(src_ip, sender_id)` match on HEARTBEAT (§13.4), every reply path
+    that involves a non-trivial reply size is gated by either the cookie
+    or AEAD-under-cluster_key — both of which require src_ip ownership
+    proof. The single exception is the unauthenticated DISCOVER → INIT
+    exchange, which is amp-neutralised by sizing DISCOVER to 62 B (§5.4)
+    so the reply is never larger than the request.
 
 ---
 
@@ -433,11 +434,16 @@ Offset  Size  Name              Type    Description
                                 (DISCOVER is unauthenticated)
 
 ── Padding (48 B, plaintext) ───────────────────────────────────────
-14      48    pad               MUST be all-zero on send.
-                                Witness MAY drop if non-zero (strict
-                                parsing) but MUST NOT echo or process
-                                the bytes. Reserved for future
-                                forward-compat use via msg_type extension.
+14      48    pad               Senders MUST set all bytes to 0.
+                                Receivers MUST ignore the padding
+                                bytes (do NOT reject on non-zero, do
+                                NOT echo or process). Reserved as a
+                                forward-compat extension point — a
+                                future deployment can repurpose any
+                                of these bytes via a new msg_type or
+                                an additional reserved-bits scheme,
+                                and current implementations will
+                                accept the packet unchanged.
 ─────────────────────────────────────────────────────────────────────
 Total: 62 bytes (fixed)
 ```
@@ -1044,9 +1050,20 @@ No specific extension is committed to.
 - Replay rejection: strict-monotonic timestamp_ms per sender; receiver-
   side `last_rx_timestamp` tracking.
 - Anti-DDoS: per-source-IP token bucket; INIT rate limit.
-- Anti-amplification: DISCOVER (62 B) ≥ INIT reply (62 B). The witness
-  cannot be turned into a UDP amplifier — the reply is never larger than
-  the request.
+- Anti-amplification, layered:
+  - **DISCOVER → INIT** is the only unauthenticated reply path; it is
+    sized 62 B → 62 B (1.0× amp factor) by padding DISCOVER (§5.4).
+  - **BOOTSTRAP → BOOTSTRAP_ACK** (110 B → 35 B) is cookie-gated: the
+    cookie proves src_ip ownership before the witness will reply.
+  - **HEARTBEAT → STATUS_LIST / STATUS_DETAIL** can produce replies
+    larger than the request, but the witness only replies if the packet
+    AEAD-decrypts under a known cluster_key AND matches an existing
+    node entry by `(src_ip, sender_id)`. Both gates require src_ip
+    ownership (the entry was created at that IP via a cookie-validated
+    BOOTSTRAP), so the witness cannot be used as a UDP reflector by
+    any off-path attacker. An on-cluster insider who already holds
+    cluster_key has direct attack capability without needing the
+    witness as an amplifier.
 - Anti-spoofing on BOOTSTRAP: DNS-style cookies bind BOOTSTRAP to a
   src_ip the sender can actually receive packets at. An off-path
   attacker cannot forge a BOOTSTRAP for a victim's IP. (See §11.2.)

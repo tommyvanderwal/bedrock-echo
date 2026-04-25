@@ -1,6 +1,7 @@
 {
-  "description": "DISCOVER probe from a node attempting witness identification",
+  "description": "DISCOVER probe (62 B, zero-padded so request size == INIT reply size)",
   "msg_type": "0x04 DISCOVER",
   "sender_id": 1,
-  "timestamp_ms": 1699999999500
+  "timestamp_ms": 1699999999500,
+  "padding_bytes": 48
 }

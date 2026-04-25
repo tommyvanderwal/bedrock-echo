@@ -27,7 +27,12 @@ OUT_DIR = Path(__file__).resolve().parent
 CLUSTER_KEY = bytes(range(0x10, 0x30))                   # 32 B, 0x10..0x2F
 WITNESS_PRIV = bytes([0xAA] * 32)                        # 32 B
 WITNESS_PUB = None  # filled in below from priv via X25519
+WITNESS_COOKIE_SECRET = bytes([0xCC] * 32)               # 32 B (fixed for cookie repro)
 EPH_PRIV = bytes([0xBB] * 32)                            # 32 B (fixed for BOOTSTRAP repro)
+
+# Fixed src_ip for vectors that require a cookie. 192.0.2.10 is in TEST-NET-1.
+BOOTSTRAP_SRC_IP = bytes([192, 0, 2, 10])                # 4 B, network byte order
+BOOTSTRAP_COOKIE = None  # filled in below from secret + src_ip
 
 NODE_A_ID = 0x01
 NODE_B_ID = 0x02
@@ -56,9 +61,10 @@ def write_pair(name: str, inputs: dict, wire_bytes: bytes):
 
 
 def main():
-    global WITNESS_PUB
+    global WITNESS_PUB, BOOTSTRAP_COOKIE
     from echo import crypto
     WITNESS_PUB = crypto.x25519_pub_from_priv(WITNESS_PRIV)
+    BOOTSTRAP_COOKIE = crypto.derive_cookie(WITNESS_COOKIE_SECRET, BOOTSTRAP_SRC_IP)
 
     print("Generating Bedrock Echo v1 test vectors")
     print(f"  output dir: {OUT_DIR}")
@@ -201,40 +207,52 @@ def main():
     }
     write_pair("07_status_detail_not_found", inputs, sd_nf.encode(CLUSTER_KEY))
 
-    # 08: DISCOVER
+    # 08: DISCOVER (62 B, zero-padded for anti-amplification)
     disc = proto.Discover(sender_id=NODE_A_ID, timestamp_ms=TS_DISCOVER)
     inputs = {
-        "description": "DISCOVER probe from a node attempting witness identification",
+        "description": "DISCOVER probe (62 B, zero-padded so request size == INIT reply size)",
         "msg_type": "0x04 DISCOVER",
         "sender_id": NODE_A_ID,
         "timestamp_ms": TS_DISCOVER,
+        "padding_bytes": 48,
     }
     write_pair("08_discover", inputs, disc.encode())
 
-    # 09: UNKNOWN_SOURCE with witness_pubkey
-    us = proto.UnknownSource(timestamp_ms=TS_WITNESS_REPLY + 4, witness_pubkey=WITNESS_PUB)
+    # 09: INIT with witness_pubkey + cookie
+    init = proto.Init(
+        timestamp_ms=TS_WITNESS_REPLY + 4,
+        witness_pubkey=WITNESS_PUB,
+        cookie=BOOTSTRAP_COOKIE,
+    )
     inputs = {
-        "description": "UNKNOWN_SOURCE reply carrying witness_pubkey for discovery",
-        "msg_type": "0x10 UNKNOWN_SOURCE",
+        "description": "INIT reply carrying witness_pubkey and the anti-spoof cookie for src_ip",
+        "msg_type": "0x10 INIT",
         "timestamp_ms": TS_WITNESS_REPLY + 4,
         "witness_pubkey": hexstr(WITNESS_PUB),
+        "witness_cookie_secret": hexstr(WITNESS_COOKIE_SECRET),
+        "src_ip": ".".join(str(b) for b in BOOTSTRAP_SRC_IP),
+        "cookie": hexstr(BOOTSTRAP_COOKIE),
     }
-    write_pair("09_unknown_source", inputs, us.encode())
+    write_pair("09_init", inputs, init.encode())
 
-    # 10: BOOTSTRAP (fixed eph_priv for reproducibility)
+    # 10: BOOTSTRAP (fixed eph_priv + cookie for reproducibility)
     bs = proto.Bootstrap(
         sender_id=NODE_A_ID,
         timestamp_ms=TS_BOOTSTRAP,
         cluster_key=CLUSTER_KEY,
+        cookie=BOOTSTRAP_COOKIE,
     )
     bs_wire = bs.encode(WITNESS_PUB, EPH_PRIV)
     inputs = {
-        "description": "BOOTSTRAP delivering cluster_key (fixed eph_priv for reproducibility)",
+        "description": "BOOTSTRAP delivering cluster_key with cookie in AAD (fixed eph_priv)",
         "msg_type": "0x20 BOOTSTRAP",
         "sender_id": NODE_A_ID,
         "timestamp_ms": TS_BOOTSTRAP,
         "cluster_key": hexstr(CLUSTER_KEY),
         "witness_pubkey": hexstr(WITNESS_PUB),
+        "witness_cookie_secret": hexstr(WITNESS_COOKIE_SECRET),
+        "src_ip": ".".join(str(b) for b in BOOTSTRAP_SRC_IP),
+        "cookie": hexstr(BOOTSTRAP_COOKIE),
         "eph_priv": hexstr(EPH_PRIV),
     }
     write_pair("10_bootstrap", inputs, bs_wire)
@@ -289,20 +307,22 @@ Vectors:
   05  STATUS_LIST empty                                           (cluster_key)
   06  STATUS_DETAIL found, 4-block peer_payload                   (cluster_key)
   07  STATUS_DETAIL not found                                     (cluster_key)
-  08  DISCOVER                                                    (no auth)
-  09  UNKNOWN_SOURCE with witness_pubkey                          (no auth)
-  10  BOOTSTRAP (fixed eph_priv)                                  (X25519 + AEAD)
+  08  DISCOVER (62 B, zero-padded)                                (no auth)
+  09  INIT with witness_pubkey + cookie                           (no auth)
+  10  BOOTSTRAP (fixed eph_priv, fixed cookie)                    (X25519 + AEAD)
   11  BOOTSTRAP_ACK status=0x00 (new)                             (cluster_key)
   12  BOOTSTRAP_ACK status=0x01 (idempotent)                      (cluster_key)
 
 Reproducibility constants (in .in.json files):
-  cluster_key   = 0x10..0x2F (32 bytes)
-  witness_priv  = 0xAA × 32  (used to derive witness_pubkey)
-  eph_priv      = 0xBB × 32  (used in BOOTSTRAP)
-  node A id     = 0x01
-  node B id     = 0x02
-  node C id     = 0x03
-  witness id    = 0xFF
+  cluster_key            = 0x10..0x2F (32 bytes)
+  witness_priv           = 0xAA × 32  (used to derive witness_pubkey)
+  witness_cookie_secret  = 0xCC × 32  (used to derive cookies in 09/10)
+  eph_priv               = 0xBB × 32  (used in BOOTSTRAP)
+  node A id              = 0x01
+  node B id              = 0x02
+  node C id              = 0x03
+  witness id             = 0xFF
+  bootstrap src_ip       = 192.0.2.10  (for cookie derivation in 09/10)
 """
     (OUT_DIR / "MANIFEST").write_text(manifest)
     print()

@@ -5,11 +5,15 @@ that document byte-for-byte. Every function is pure: no I/O, no time.
 
 Wire format summary:
   header (14 B):   magic | msg_type | sender_id | timestamp_ms
-  payload:         encrypted (most types) or plaintext (DISCOVER, UNKNOWN_SOURCE)
+  payload:         encrypted (most types) or plaintext (DISCOVER, INIT)
   trailer (16 B):  Poly1305 tag (AEAD types) or absent (unauthenticated types)
 
 Block-granular payload sizing: own_payload, peer_payload are 0..36 blocks
 of 32 bytes each, declared by an inline u8 count field where applicable.
+
+Anti-spoof cookie (PROTOCOL.md §11.2): INIT carries a 16-byte cookie
+bound to the requester's src_ip; BOOTSTRAP must echo it. The cookie is
+plaintext but covered by the BOOTSTRAP AAD.
 """
 from __future__ import annotations
 
@@ -35,13 +39,13 @@ MSG_HEARTBEAT       = 0x01
 MSG_STATUS_LIST     = 0x02
 MSG_STATUS_DETAIL   = 0x03
 MSG_DISCOVER        = 0x04
-MSG_UNKNOWN_SOURCE  = 0x10
+MSG_INIT            = 0x10
 MSG_BOOTSTRAP       = 0x20
 MSG_BOOTSTRAP_ACK   = 0x21
 
 ALL_MSG_TYPES = {
     MSG_HEARTBEAT, MSG_STATUS_LIST, MSG_STATUS_DETAIL, MSG_DISCOVER,
-    MSG_UNKNOWN_SOURCE, MSG_BOOTSTRAP, MSG_BOOTSTRAP_ACK,
+    MSG_INIT, MSG_BOOTSTRAP, MSG_BOOTSTRAP_ACK,
 }
 
 AEAD_CLUSTER_KEY_TYPES = {
@@ -69,12 +73,21 @@ CLUSTER_KEY_LEN = 32
 EPH_PUBKEY_LEN = 32
 WITNESS_PUBKEY_LEN = 32
 
+# anti-spoof cookie (PROTOCOL.md §11.2)
+COOKIE_LEN = 16
+WITNESS_COOKIE_SECRET_LEN = 32
+
+# DISCOVER zero-padding to make request size == INIT reply size
+# (anti-amplification — PROTOCOL.md §1 principle 13, §5.4)
+DISCOVER_PAD_LEN = 48
+
 # total packet sizes
-DISCOVER_LEN = HEADER_LEN
-UNKNOWN_SOURCE_LEN = HEADER_LEN + WITNESS_PUBKEY_LEN
-BOOTSTRAP_LEN = HEADER_LEN + EPH_PUBKEY_LEN + CLUSTER_KEY_LEN + AEAD_TAG_LEN
+DISCOVER_LEN = HEADER_LEN + DISCOVER_PAD_LEN                                 # 62
+INIT_LEN = HEADER_LEN + WITNESS_PUBKEY_LEN + COOKIE_LEN                      # 62
+BOOTSTRAP_LEN = (HEADER_LEN + COOKIE_LEN + EPH_PUBKEY_LEN
+                 + CLUSTER_KEY_LEN + AEAD_TAG_LEN)                           # 110
 BOOTSTRAP_ACK_PLAINTEXT_LEN = 5  # status (1) + witness_uptime_seconds (4)
-BOOTSTRAP_ACK_LEN = HEADER_LEN + BOOTSTRAP_ACK_PLAINTEXT_LEN + AEAD_TAG_LEN
+BOOTSTRAP_ACK_LEN = HEADER_LEN + BOOTSTRAP_ACK_PLAINTEXT_LEN + AEAD_TAG_LEN  # 35
 
 # STATUS_DETAIL status_and_blocks byte
 STATUS_DETAIL_NOT_FOUND_BIT = 0x80
@@ -409,7 +422,11 @@ class Discover:
 
     def encode(self) -> bytes:
         _validate_node_sender_id(self.sender_id)
-        return Header(MSG_DISCOVER, self.sender_id, self.timestamp_ms).pack()
+        # 14 B header + 48 B zero padding = 62 B total. The padding makes
+        # the request size match the INIT reply size, so DISCOVER cannot
+        # be used as a UDP amplifier.
+        header = Header(MSG_DISCOVER, self.sender_id, self.timestamp_ms).pack()
+        return header + b"\x00" * DISCOVER_PAD_LEN
 
 
 def decode_discover(buf: bytes) -> Discover:
@@ -421,37 +438,43 @@ def decode_discover(buf: bytes) -> Discover:
     if header.msg_type != MSG_DISCOVER:
         raise ProtocolError("not a DISCOVER")
     _validate_node_sender_id(header.sender_id)
+    # Padding bytes 14..62: spec says senders MUST zero, witness MAY check.
+    # We don't enforce zero-only here so the witness can be lenient against
+    # future forward-compat use; the protocol tests verify zero on encode.
     return Discover(sender_id=header.sender_id, timestamp_ms=header.timestamp_ms)
 
 
-# ── UNKNOWN_SOURCE (0x10) — witness → node, unauthenticated ───────────────
+# ── INIT (0x10) — witness → node, unauthenticated ─────────────────────────
 
 
 @dataclass(frozen=True)
-class UnknownSource:
+class Init:
     timestamp_ms: int           # witness's best-effort wall-clock; MAY be 0
     witness_pubkey: bytes       # X25519 public key, 32 bytes
+    cookie: bytes               # 16 B, cookie(witness_secret, src_ip), §11.2
 
     def encode(self) -> bytes:
         if len(self.witness_pubkey) != WITNESS_PUBKEY_LEN:
             raise ProtocolError("witness_pubkey must be 32 bytes")
-        header = Header(MSG_UNKNOWN_SOURCE, WITNESS_SENDER_ID, self.timestamp_ms)
-        return header.pack() + self.witness_pubkey
+        if len(self.cookie) != COOKIE_LEN:
+            raise ProtocolError(f"cookie must be {COOKIE_LEN} bytes")
+        header = Header(MSG_INIT, WITNESS_SENDER_ID, self.timestamp_ms)
+        return header.pack() + self.witness_pubkey + self.cookie
 
 
-def decode_unknown_source(buf: bytes) -> UnknownSource:
-    if len(buf) != UNKNOWN_SOURCE_LEN:
+def decode_init(buf: bytes) -> Init:
+    if len(buf) != INIT_LEN:
         raise ProtocolError(
-            f"UNKNOWN_SOURCE must be exactly {UNKNOWN_SOURCE_LEN} bytes, "
-            f"got {len(buf)}"
+            f"INIT must be exactly {INIT_LEN} bytes, got {len(buf)}"
         )
     header = Header.unpack(buf)
-    if header.msg_type != MSG_UNKNOWN_SOURCE:
-        raise ProtocolError("not UNKNOWN_SOURCE")
+    if header.msg_type != MSG_INIT:
+        raise ProtocolError("not INIT")
     _validate_witness_sender_id(header.sender_id)
-    return UnknownSource(
+    return Init(
         timestamp_ms=header.timestamp_ms,
-        witness_pubkey=bytes(buf[HEADER_LEN:]),
+        witness_pubkey=bytes(buf[HEADER_LEN:HEADER_LEN + WITNESS_PUBKEY_LEN]),
+        cookie=bytes(buf[HEADER_LEN + WITNESS_PUBKEY_LEN:INIT_LEN]),
     )
 
 
@@ -463,18 +486,22 @@ class Bootstrap:
     sender_id: int
     timestamp_ms: int
     cluster_key: bytes          # the secret being delivered (32 B)
+    cookie: bytes               # 16 B anti-spoof token from prior INIT (§11.2)
 
     def encode(self, witness_pubkey: bytes, eph_priv: bytes) -> bytes:
         _validate_node_sender_id(self.sender_id)
         if len(self.cluster_key) != CLUSTER_KEY_LEN:
             raise ProtocolError("cluster_key must be 32 bytes")
+        if len(self.cookie) != COOKIE_LEN:
+            raise ProtocolError(f"cookie must be {COOKIE_LEN} bytes")
         if len(eph_priv) != 32 or len(witness_pubkey) != 32:
             raise ProtocolError("bad key lengths")
         eph_pub = crypto.x25519_pub_from_priv(eph_priv)
         shared = crypto.x25519_shared(eph_priv, witness_pubkey)
         aead_key = crypto.hkdf_sha256(shared)
         header = Header(MSG_BOOTSTRAP, self.sender_id, self.timestamp_ms)
-        aad = header.pack()
+        # AAD = header || cookie (PROTOCOL.md §4.3, §5.6)
+        aad = header.pack() + self.cookie
         ct = crypto.aead_encrypt(aead_key, crypto.BOOTSTRAP_AEAD_NONCE, aad,
                                  self.cluster_key)
         return aad + eph_pub + ct
@@ -489,8 +516,10 @@ def decode_bootstrap(buf: bytes, witness_priv: bytes) -> Bootstrap:
     if header.msg_type != MSG_BOOTSTRAP:
         raise ProtocolError("not a BOOTSTRAP")
     _validate_node_sender_id(header.sender_id)
-    eph_pub = bytes(buf[HEADER_LEN:HEADER_LEN + EPH_PUBKEY_LEN])
-    ciphertext = bytes(buf[HEADER_LEN + EPH_PUBKEY_LEN:])
+    cookie = bytes(buf[HEADER_LEN:HEADER_LEN + COOKIE_LEN])
+    aad_end = HEADER_LEN + COOKIE_LEN  # 30
+    eph_pub = bytes(buf[aad_end:aad_end + EPH_PUBKEY_LEN])
+    ciphertext = bytes(buf[aad_end + EPH_PUBKEY_LEN:])
     try:
         shared = crypto.x25519_shared(witness_priv, eph_pub)
     except Exception as e:
@@ -499,7 +528,7 @@ def decode_bootstrap(buf: bytes, witness_priv: bytes) -> Bootstrap:
     aead_key = crypto.hkdf_sha256(shared)
     try:
         plaintext = crypto.aead_decrypt(aead_key, crypto.BOOTSTRAP_AEAD_NONCE,
-                                        buf[:HEADER_LEN], ciphertext)
+                                        buf[:aad_end], ciphertext)
     except InvalidTag as e:
         raise AuthError("BOOTSTRAP AEAD tag verification failed") from e
     if len(plaintext) != CLUSTER_KEY_LEN:
@@ -511,6 +540,7 @@ def decode_bootstrap(buf: bytes, witness_priv: bytes) -> Bootstrap:
         sender_id=header.sender_id,
         timestamp_ms=header.timestamp_ms,
         cluster_key=plaintext,
+        cookie=cookie,
     )
 
 

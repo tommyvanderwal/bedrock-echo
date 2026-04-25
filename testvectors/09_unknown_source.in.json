@@ -1,6 +1,0 @@
-{
-  "description": "UNKNOWN_SOURCE reply carrying witness_pubkey for discovery",
-  "msg_type": "0x10 UNKNOWN_SOURCE",
-  "timestamp_ms": 1700000000054,
-  "witness_pubkey": "14ca9e4d387bccf35746e0407daaacc6b28a4f8445ef5a5158894db983e24070"
-}

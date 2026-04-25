@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import os
 
+import hashlib
+
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import (
     X25519PrivateKey,
@@ -87,3 +89,23 @@ def aead_decrypt(key: bytes, nonce: bytes, aad: bytes, ciphertext: bytes) -> byt
 
 def random_bytes(n: int) -> bytes:
     return os.urandom(n)
+
+
+def derive_cookie(witness_cookie_secret: bytes, src_ip_be: bytes) -> bytes:
+    """Anti-spoof cookie (PROTOCOL.md §11.2):
+
+        cookie = SHA-256(witness_cookie_secret || src_ip_be)[:16]
+
+    The witness emits this in INIT and validates it on BOOTSTRAP. The
+    cookie is not secret — it is a short MAC over src_ip under a
+    witness-only key, used to prove the bootstrapper can receive
+    packets at the IP they're claiming.
+
+    src_ip_be is 4 bytes for IPv4 in network byte order. (BOOTSTRAP is
+    IPv4-only in v1.)
+    """
+    if len(witness_cookie_secret) != 32:
+        raise ValueError("witness_cookie_secret must be 32 bytes")
+    if len(src_ip_be) != 4:
+        raise ValueError("src_ip_be must be 4 bytes (IPv4)")
+    return hashlib.sha256(witness_cookie_secret + src_ip_be).digest()[:16]

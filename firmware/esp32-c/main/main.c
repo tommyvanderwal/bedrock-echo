@@ -97,10 +97,11 @@ static void udp_server_task(void *arg) {
         }
         uint8_t src_ipv4[4];
         memcpy(src_ipv4, &src.sin_addr.s_addr, 4);
+        uint16_t src_port = ntohs(src.sin_port);
 
         size_t out_len = 0;
         bool reply = echo_handle_packet(&g_state, rx_buf, (size_t)n,
-                                         src_ipv4, now_ms(),
+                                         src_ipv4, src_port, now_ms(),
                                          tx_buf, sizeof(tx_buf), &out_len);
         if (reply && out_len > 0) {
             sendto(sock, tx_buf, out_len, 0, (struct sockaddr *)&src, slen);
@@ -136,8 +137,7 @@ void app_main(void) {
 
     // 2. Initialise RAM-only witness state.
     echo_state_init(&g_state, priv, now_ms());
-    hex_dump("witness pub     ", g_state.witness_pub, 32);
-    hex_dump("witness senderid", g_state.witness_sender_id, 8);
+    hex_dump("witness pub", g_state.witness_pub, 32);
 
     // 2a. If this was the first boot (key just generated), print the
     // provisioning info block and reboot into a clean steady-state boot.

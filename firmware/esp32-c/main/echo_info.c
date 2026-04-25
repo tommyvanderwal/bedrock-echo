@@ -30,9 +30,8 @@ static void hex_to(char *dst, const uint8_t *src, size_t n) {
 }
 
 void echo_info_print(const echo_state_t *state, esp_netif_t *eth_netif) {
-    char pub_hex[65], sid_hex[17];
+    char pub_hex[65];
     hex_to(pub_hex, state->witness_pub, 32);
-    hex_to(sid_hex, state->witness_sender_id, 8);
 
     uint8_t mac[6] = {0};
     esp_read_mac(mac, ESP_MAC_ETH);
@@ -42,12 +41,12 @@ void echo_info_print(const echo_state_t *state, esp_netif_t *eth_netif) {
         esp_netif_get_ip_info(eth_netif, &ip);
     }
 
-    // Machine-readable info block. Line-oriented, key=value, so a
-    // provisioning script can just grep -E '^(pub|senderid|mac|ip|port)='
+    // Machine-readable info block. Line-oriented key=value so a
+    // provisioning script can grep -E '^(pub|mac|ip|port)='.
+    // (No senderid — in v1 the witness's sender_id is fixed at 0xFF.)
     printf("\n");
     printf("===BEDROCK-ECHO-WITNESS===\n");
     printf("pub=%s\n", pub_hex);
-    printf("senderid=%s\n", sid_hex);
     printf("mac=%02x:%02x:%02x:%02x:%02x:%02x\n",
            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     if (ip.ip.addr) {

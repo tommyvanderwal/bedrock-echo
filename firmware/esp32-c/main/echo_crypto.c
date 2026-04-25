@@ -1,11 +1,12 @@
-// Minimal bedrock-grade crypto for Bedrock Echo on ESP32.
+// Minimal bedrock-grade crypto for Bedrock Echo v1 on ESP32.
 //
 // * X25519 scalar-mult: embedded TweetNaCl reference impl (public domain).
-//   Constant-time, standalone, zero dependencies, ~60 lines. Picked over
-//   mbedTLS ECP because its Curve25519 path has too many config knobs that
-//   vary across mbedTLS builds. This way our X25519 matches the RFC 7748
-//   test vectors byte-for-byte on any target.
-// * HMAC-SHA256, HKDF-SHA256, ChaCha20-Poly1305: mbedTLS (already in IDF).
+//   Constant-time, standalone, zero dependencies. Matches RFC 7748 byte-
+//   for-byte across all our reference impls.
+// * HKDF-SHA256, ChaCha20-Poly1305 (AEAD): mbedTLS (already in IDF).
+//
+// HMAC-SHA256 has been removed in v1 — Poly1305 (built into AEAD)
+// provides integrity for all authenticated messages.
 
 #include "echo.h"
 
@@ -14,36 +15,11 @@
 #include "esp_log.h"
 #include "esp_random.h"
 #include "mbedtls/chachapoly.h"
-#include "mbedtls/constant_time.h"
 #include "mbedtls/hkdf.h"
 #include "mbedtls/md.h"
 #include "mbedtls/sha256.h"
 
 static const char *CRYPTO_TAG = "echo-crypto";
-
-// ─── HMAC-SHA256 ────────────────────────────────────────────────────────────
-
-void echo_hmac_sha256(const uint8_t *key, size_t key_len,
-                      const uint8_t *data, size_t data_len,
-                      uint8_t tag_out[32]) {
-    const mbedtls_md_info_t *md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
-    mbedtls_md_context_t ctx;
-    mbedtls_md_init(&ctx);
-    if (mbedtls_md_setup(&ctx, md, 1) == 0) {
-        mbedtls_md_hmac_starts(&ctx, key, key_len);
-        mbedtls_md_hmac_update(&ctx, data, data_len);
-        mbedtls_md_hmac_finish(&ctx, tag_out);
-    }
-    mbedtls_md_free(&ctx);
-}
-
-bool echo_hmac_verify(const uint8_t *key, size_t key_len,
-                      const uint8_t *data, size_t data_len,
-                      const uint8_t tag[32]) {
-    uint8_t computed[32];
-    echo_hmac_sha256(key, key_len, data, data_len, computed);
-    return mbedtls_ct_memcmp(computed, tag, 32) == 0;
-}
 
 // ─── X25519 (TweetNaCl scalar-mult, public domain) ──────────────────────────
 // Matches RFC 7748 exactly. Scalar and u-coordinate are 32 little-endian
@@ -222,10 +198,10 @@ bool echo_hkdf_sha256(const uint8_t *ikm, size_t ikm_len, uint8_t out[32]) {
 // ─── ChaCha20-Poly1305 ──────────────────────────────────────────────────────
 
 bool echo_aead_encrypt(const uint8_t key[32],
+                       const uint8_t nonce[ECHO_AEAD_NONCE_LEN],
                        const uint8_t *aad, size_t aad_len,
                        const uint8_t *pt, size_t pt_len,
                        uint8_t *out) {
-    static const uint8_t nonce[12] = {0};  // zero nonce safe for single-use key
     mbedtls_chachapoly_context ctx;
     mbedtls_chachapoly_init(&ctx);
     bool ok = false;
@@ -241,11 +217,11 @@ out:
 }
 
 bool echo_aead_decrypt(const uint8_t key[32],
+                       const uint8_t nonce[ECHO_AEAD_NONCE_LEN],
                        const uint8_t *aad, size_t aad_len,
                        const uint8_t *ct, size_t ct_len,
                        uint8_t *out) {
     if (ct_len < 16) return false;
-    static const uint8_t nonce[12] = {0};
     size_t pt_len = ct_len - 16;
     mbedtls_chachapoly_context ctx;
     mbedtls_chachapoly_init(&ctx);

@@ -1,47 +1,39 @@
-// Echo header + per-msg-type encode/decode helpers.
-// Byte-for-byte match with python/echo/proto.py and crates/bedrock-echo-proto.
+// Wire-format encode/decode for Bedrock Echo v1.
 
 #include "echo.h"
 #include <string.h>
 
-static inline void w_u16(uint8_t *p, uint16_t v) { p[0] = v >> 8; p[1] = v & 0xff; }
-static inline uint16_t r_u16(const uint8_t *p) { return (p[0] << 8) | p[1]; }
-static inline void w_u32(uint8_t *p, uint32_t v) {
-    p[0] = v >> 24; p[1] = v >> 16; p[2] = v >> 8; p[3] = v;
-}
-static inline uint32_t r_u32(const uint8_t *p) {
-    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16)
-         | ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
-}
-static inline void w_u64(uint8_t *p, uint64_t v) {
-    for (int i = 7; i >= 0; --i) { p[7 - i] = (v >> (i * 8)) & 0xff; }
-}
-static inline uint64_t r_u64(const uint8_t *p) {
-    uint64_t v = 0;
-    for (int i = 0; i < 8; ++i) v = (v << 8) | p[i];
-    return v;
+// ─── Internal helpers ───────────────────────────────────────────────────────
+
+static inline void wr_u32_be(uint8_t *p, uint32_t v) {
+    p[0] = (v >> 24) & 0xFF; p[1] = (v >> 16) & 0xFF;
+    p[2] = (v >> 8)  & 0xFF; p[3] =  v        & 0xFF;
 }
 
-uint8_t echo_trailer_len(uint8_t msg_type) {
-    switch (msg_type) {
+static inline void wr_i64_be(uint8_t *p, int64_t v) {
+    uint64_t u = (uint64_t)v;
+    p[0] = (u >> 56) & 0xFF; p[1] = (u >> 48) & 0xFF;
+    p[2] = (u >> 40) & 0xFF; p[3] = (u >> 32) & 0xFF;
+    p[4] = (u >> 24) & 0xFF; p[5] = (u >> 16) & 0xFF;
+    p[6] = (u >> 8)  & 0xFF; p[7] =  u        & 0xFF;
+}
+
+static inline int64_t rd_i64_be(const uint8_t *p) {
+    uint64_t u = ((uint64_t)p[0] << 56) | ((uint64_t)p[1] << 48) |
+                 ((uint64_t)p[2] << 40) | ((uint64_t)p[3] << 32) |
+                 ((uint64_t)p[4] << 24) | ((uint64_t)p[5] << 16) |
+                 ((uint64_t)p[6] << 8)  |  (uint64_t)p[7];
+    return (int64_t)u;
+}
+
+static bool is_known_msg_type(uint8_t t) {
+    switch (t) {
         case ECHO_MSG_HEARTBEAT:
         case ECHO_MSG_STATUS_LIST:
         case ECHO_MSG_STATUS_DETAIL:
-        case ECHO_MSG_BOOTSTRAP_ACK:
-            return ECHO_HMAC_LEN;
+        case ECHO_MSG_DISCOVER:
         case ECHO_MSG_UNKNOWN_SOURCE:
         case ECHO_MSG_BOOTSTRAP:
-            return 0;
-        default:
-            return 0xff;
-    }
-}
-
-bool echo_is_hmac_type(uint8_t msg_type) {
-    switch (msg_type) {
-        case ECHO_MSG_HEARTBEAT:
-        case ECHO_MSG_STATUS_LIST:
-        case ECHO_MSG_STATUS_DETAIL:
         case ECHO_MSG_BOOTSTRAP_ACK:
             return true;
         default:
@@ -49,295 +41,328 @@ bool echo_is_hmac_type(uint8_t msg_type) {
     }
 }
 
+// ─── Header ─────────────────────────────────────────────────────────────────
+
 echo_err_t echo_header_pack(uint8_t out[ECHO_HEADER_LEN], const echo_header_t *hdr) {
     memcpy(out, ECHO_MAGIC, 4);
     out[4] = hdr->msg_type;
-    out[5] = hdr->flags;
-    memcpy(out + 6, hdr->sender_id, 8);
-    w_u64(out + 14, hdr->sequence);
-    w_u64(out + 22, (uint64_t)hdr->timestamp_ms);
-    w_u16(out + 30, hdr->payload_len);
+    out[5] = hdr->sender_id;
+    wr_i64_be(out + 6, hdr->timestamp_ms);
     return ECHO_OK;
 }
 
 echo_err_t echo_header_unpack(echo_header_t *out, const uint8_t *buf, size_t len) {
     if (len < ECHO_HEADER_LEN) return ECHO_ERR_TOO_SHORT;
     if (memcmp(buf, ECHO_MAGIC, 4) != 0) return ECHO_ERR_BAD_MAGIC;
+    if (!is_known_msg_type(buf[4])) return ECHO_ERR_BAD_MSG_TYPE;
     out->msg_type = buf[4];
-    out->flags = buf[5];
-    if (out->flags != 0) return ECHO_ERR_BAD_FLAGS;
-    uint8_t tl = echo_trailer_len(out->msg_type);
-    if (tl == 0xff) return ECHO_ERR_BAD_MSG_TYPE;
-    memcpy(out->sender_id, buf + 6, 8);
-    out->sequence = r_u64(buf + 14);
-    out->timestamp_ms = (int64_t)r_u64(buf + 22);
-    out->payload_len = r_u16(buf + 30);
+    out->sender_id = buf[5];
+    out->timestamp_ms = rd_i64_be(buf + 6);
     return ECHO_OK;
 }
 
-// ─── HMAC helpers ───────────────────────────────────────────────────────────
-static void finalize_hmac(uint8_t *buf, size_t body_len, const uint8_t *key) {
-    uint8_t tag[32];
-    echo_hmac_sha256(key, ECHO_CLUSTER_KEY_LEN, buf, body_len, tag);
-    memcpy(buf + body_len, tag, 32);
+void echo_derive_nonce(uint8_t out[ECHO_AEAD_NONCE_LEN],
+                        uint8_t sender_id, int64_t timestamp_ms) {
+    out[0] = sender_id;
+    out[1] = 0; out[2] = 0; out[3] = 0;
+    wr_i64_be(out + 4, timestamp_ms);
 }
 
-// Returns true iff trailer verifies.
-static bool verify_hmac(const uint8_t *buf, size_t total_len, const uint8_t *key) {
-    if (total_len < 32) return false;
-    size_t body_len = total_len - 32;
-    return echo_hmac_verify(key, ECHO_CLUSTER_KEY_LEN, buf, body_len, buf + body_len);
-}
-
-// ─── HEARTBEAT 0x01 ─────────────────────────────────────────────────────────
-// Decoder used on witness; encoder isn't needed (only nodes send heartbeats).
-
-typedef struct {
-    echo_header_t hdr;
-    uint8_t query_target_id[8];
-    const uint8_t *own_payload;
-    size_t own_payload_len;
-} echo_heartbeat_view_t;
-
-echo_err_t echo_decode_heartbeat(echo_heartbeat_view_t *out,
-                                  const uint8_t *buf, size_t len,
-                                  const uint8_t *cluster_key) {
-    if (len > ECHO_MTU_CAP) return ECHO_ERR_OVER_MTU;
-    if (!verify_hmac(buf, len, cluster_key)) return ECHO_ERR_AUTH_FAILED;
-    echo_err_t e = echo_header_unpack(&out->hdr, buf, len);
-    if (e != ECHO_OK) return e;
-    if (out->hdr.msg_type != ECHO_MSG_HEARTBEAT) return ECHO_ERR_BAD_MSG_TYPE;
-    if (len != (size_t)(ECHO_HEADER_LEN + out->hdr.payload_len + 32))
-        return ECHO_ERR_BAD_LENGTH;
-    size_t pl = out->hdr.payload_len;
-    if (pl < 8 || pl > 8 + ECHO_NODE_PAYLOAD_MAX) return ECHO_ERR_BAD_PAYLOAD_LEN;
-    static const uint8_t zero8[8] = {0};
-    if (memcmp(out->hdr.sender_id, zero8, 8) == 0) return ECHO_ERR_ZERO_SENDER_ID;
-    memcpy(out->query_target_id, buf + ECHO_HEADER_LEN, 8);
-    out->own_payload = buf + ECHO_HEADER_LEN + 8;
-    out->own_payload_len = pl - 8;
-    return ECHO_OK;
-}
-
-// Forward-declared for internal use; definitions below.
-echo_err_t echo_encode_heartbeat(uint8_t *out, size_t out_cap, size_t *out_len,
-                                  const uint8_t sender_id[8], uint64_t seq,
-                                  int64_t ts_ms, const uint8_t query[8],
-                                  const uint8_t *own_payload, size_t own_len,
-                                  const uint8_t *cluster_key);
+// ─── HEARTBEAT (0x01) ───────────────────────────────────────────────────────
 
 echo_err_t echo_encode_heartbeat(uint8_t *out, size_t out_cap, size_t *out_len,
-                                  const uint8_t sender_id[8], uint64_t seq,
-                                  int64_t ts_ms, const uint8_t query[8],
-                                  const uint8_t *own_payload, size_t own_len,
-                                  const uint8_t *cluster_key) {
-    if (own_len > ECHO_NODE_PAYLOAD_MAX) return ECHO_ERR_BAD_PAYLOAD_LEN;
-    size_t pl = 8 + own_len;
-    size_t total = ECHO_HEADER_LEN + pl + 32;
+                                  uint8_t sender_id, int64_t timestamp_ms,
+                                  uint8_t query_target_id,
+                                  const uint8_t *own_payload, size_t own_payload_len,
+                                  const uint8_t cluster_key[32]) {
+    if (sender_id > ECHO_NODE_SENDER_ID_MAX) return ECHO_ERR_BAD_SENDER_ID;
+    if (own_payload_len % ECHO_PAYLOAD_BLOCK_SIZE != 0) return ECHO_ERR_BAD_PAYLOAD_SIZE;
+    if (own_payload_len > ECHO_PAYLOAD_MAX_BYTES) return ECHO_ERR_BAD_PAYLOAD_SIZE;
+    size_t n_blocks = own_payload_len / ECHO_PAYLOAD_BLOCK_SIZE;
+    size_t pt_len = 2 + own_payload_len;
+    size_t total = ECHO_HEADER_LEN + pt_len + ECHO_AEAD_TAG_LEN;
     if (total > ECHO_MTU_CAP) return ECHO_ERR_OVER_MTU;
     if (out_cap < total) return ECHO_ERR_BAD_LENGTH;
-    echo_header_t h = {
-        .msg_type = ECHO_MSG_HEARTBEAT, .flags = 0,
-        .sequence = seq, .timestamp_ms = ts_ms,
-        .payload_len = (uint16_t)pl,
-    };
-    memcpy(h.sender_id, sender_id, 8);
-    echo_header_pack(out, &h);
-    memcpy(out + ECHO_HEADER_LEN, query, 8);
-    if (own_len) memcpy(out + ECHO_HEADER_LEN + 8, own_payload, own_len);
-    finalize_hmac(out, ECHO_HEADER_LEN + pl, cluster_key);
+
+    echo_header_t hdr = { .msg_type = ECHO_MSG_HEARTBEAT,
+                          .sender_id = sender_id,
+                          .timestamp_ms = timestamp_ms };
+    echo_header_pack(out, &hdr);
+
+    uint8_t pt[2 + ECHO_PAYLOAD_MAX_BYTES];
+    pt[0] = query_target_id;
+    pt[1] = (uint8_t)n_blocks;
+    if (own_payload_len) memcpy(pt + 2, own_payload, own_payload_len);
+
+    uint8_t nonce[ECHO_AEAD_NONCE_LEN];
+    echo_derive_nonce(nonce, sender_id, timestamp_ms);
+    if (!echo_aead_encrypt(cluster_key, nonce, out, ECHO_HEADER_LEN,
+                           pt, pt_len, out + ECHO_HEADER_LEN)) {
+        return ECHO_ERR_AUTH_FAILED;
+    }
     *out_len = total;
     return ECHO_OK;
 }
 
-// ─── STATUS_LIST 0x02 ───────────────────────────────────────────────────────
-// Entry format: sender_id(8) + ipv4(4) + last_seen_seconds(u32) = 16 bytes.
+echo_err_t echo_decode_heartbeat(const uint8_t *buf, size_t buf_len,
+                                  const uint8_t cluster_key[32],
+                                  echo_header_t *out_header,
+                                  uint8_t *out_query_target_id,
+                                  uint8_t *pt_scratch, size_t pt_scratch_cap,
+                                  const uint8_t **out_own_payload,
+                                  size_t *out_own_payload_len) {
+    if (buf_len < ECHO_HEADER_LEN + 2 + ECHO_AEAD_TAG_LEN) return ECHO_ERR_TOO_SHORT;
+    echo_err_t e = echo_header_unpack(out_header, buf, buf_len);
+    if (e != ECHO_OK) return e;
+    if (out_header->msg_type != ECHO_MSG_HEARTBEAT) return ECHO_ERR_BAD_MSG_TYPE;
 
-typedef struct {
-    uint8_t peer_sender_id[8];
-    uint8_t peer_ipv4[4];
-    uint32_t last_seen_seconds;
-} echo_list_entry_t;
+    uint8_t nonce[ECHO_AEAD_NONCE_LEN];
+    echo_derive_nonce(nonce, out_header->sender_id, out_header->timestamp_ms);
+
+    size_t ct_len = buf_len - ECHO_HEADER_LEN;
+    size_t pt_len = ct_len - ECHO_AEAD_TAG_LEN;
+    if (pt_len > pt_scratch_cap) return ECHO_ERR_BAD_LENGTH;
+    if (!echo_aead_decrypt(cluster_key, nonce, buf, ECHO_HEADER_LEN,
+                           buf + ECHO_HEADER_LEN, ct_len, pt_scratch)) {
+        return ECHO_ERR_AUTH_FAILED;
+    }
+
+    if (pt_len < 2) return ECHO_ERR_BAD_LENGTH;
+    *out_query_target_id = pt_scratch[0];
+    uint8_t n_blocks = pt_scratch[1];
+    if (n_blocks > ECHO_PAYLOAD_MAX_BLOCKS) return ECHO_ERR_BAD_FIELD;
+    size_t expected_pt = 2 + (size_t)n_blocks * ECHO_PAYLOAD_BLOCK_SIZE;
+    if (pt_len != expected_pt) return ECHO_ERR_BAD_LENGTH;
+    *out_own_payload = pt_scratch + 2;
+    *out_own_payload_len = (size_t)n_blocks * ECHO_PAYLOAD_BLOCK_SIZE;
+    return ECHO_OK;
+}
+
+// ─── STATUS_LIST (0x02) ─────────────────────────────────────────────────────
 
 echo_err_t echo_encode_status_list(uint8_t *out, size_t out_cap, size_t *out_len,
-                                    const uint8_t sender_id[8], uint64_t seq,
-                                    int64_t ts_ms, uint64_t witness_uptime_ms,
-                                    const echo_list_entry_t *entries, size_t n_entries,
-                                    const uint8_t *cluster_key) {
-    if (n_entries > ECHO_LIST_MAX_ENTRIES) return ECHO_ERR_BAD_PAYLOAD_LEN;
-    size_t pl = 10 + n_entries * ECHO_LIST_ENTRY_LEN;
-    size_t total = ECHO_HEADER_LEN + pl + 32;
+                                    int64_t timestamp_ms,
+                                    uint32_t witness_uptime_seconds,
+                                    const echo_list_entry_t *entries, size_t num_entries,
+                                    const uint8_t cluster_key[32]) {
+    if (num_entries > ECHO_LIST_MAX_ENTRIES) return ECHO_ERR_BAD_FIELD;
+    size_t pt_len = 5 + num_entries * ECHO_LIST_ENTRY_LEN;
+    size_t total = ECHO_HEADER_LEN + pt_len + ECHO_AEAD_TAG_LEN;
     if (total > ECHO_MTU_CAP) return ECHO_ERR_OVER_MTU;
     if (out_cap < total) return ECHO_ERR_BAD_LENGTH;
-    echo_header_t h = {
-        .msg_type = ECHO_MSG_STATUS_LIST, .flags = 0,
-        .sequence = seq, .timestamp_ms = ts_ms,
-        .payload_len = (uint16_t)pl,
-    };
-    memcpy(h.sender_id, sender_id, 8);
-    echo_header_pack(out, &h);
-    uint8_t *p = out + ECHO_HEADER_LEN;
-    w_u64(p, witness_uptime_ms); p += 8;
-    *p++ = (uint8_t)n_entries;
-    *p++ = 0;  // reserved
-    for (size_t i = 0; i < n_entries; ++i) {
-        memcpy(p, entries[i].peer_sender_id, 8); p += 8;
-        memcpy(p, entries[i].peer_ipv4, 4); p += 4;
-        w_u32(p, entries[i].last_seen_seconds); p += 4;
+
+    echo_header_t hdr = { .msg_type = ECHO_MSG_STATUS_LIST,
+                          .sender_id = ECHO_WITNESS_SENDER_ID,
+                          .timestamp_ms = timestamp_ms };
+    echo_header_pack(out, &hdr);
+
+    uint8_t pt[5 + ECHO_LIST_MAX_ENTRIES * ECHO_LIST_ENTRY_LEN];
+    wr_u32_be(pt, witness_uptime_seconds);
+    pt[4] = (uint8_t)num_entries;
+    size_t off = 5;
+    for (size_t i = 0; i < num_entries; ++i) {
+        pt[off] = entries[i].peer_sender_id;
+        wr_u32_be(pt + off + 1, entries[i].last_seen_ms);
+        off += ECHO_LIST_ENTRY_LEN;
     }
-    finalize_hmac(out, ECHO_HEADER_LEN + pl, cluster_key);
+
+    uint8_t nonce[ECHO_AEAD_NONCE_LEN];
+    echo_derive_nonce(nonce, ECHO_WITNESS_SENDER_ID, timestamp_ms);
+    if (!echo_aead_encrypt(cluster_key, nonce, out, ECHO_HEADER_LEN,
+                           pt, pt_len, out + ECHO_HEADER_LEN)) {
+        return ECHO_ERR_AUTH_FAILED;
+    }
     *out_len = total;
     return ECHO_OK;
 }
 
-// ─── STATUS_DETAIL 0x03 ─────────────────────────────────────────────────────
+// ─── STATUS_DETAIL (0x03) ───────────────────────────────────────────────────
 
-echo_err_t echo_encode_status_detail_found(
-    uint8_t *out, size_t out_cap, size_t *out_len,
-    const uint8_t sender_id[8], uint64_t seq, int64_t ts_ms,
-    uint64_t witness_uptime_ms,
-    const uint8_t target_sender_id[8],
-    const uint8_t peer_ipv4[4], uint32_t last_seen_seconds,
-    const uint8_t *peer_payload, size_t peer_payload_len,
-    const uint8_t *cluster_key) {
-    if (peer_payload_len > ECHO_NODE_PAYLOAD_MAX) return ECHO_ERR_BAD_PAYLOAD_LEN;
-    size_t pl = 27 + peer_payload_len;
-    size_t total = ECHO_HEADER_LEN + pl + 32;
+echo_err_t echo_encode_status_detail_found(uint8_t *out, size_t out_cap, size_t *out_len,
+                                            int64_t timestamp_ms,
+                                            uint32_t witness_uptime_seconds,
+                                            uint8_t target_sender_id,
+                                            const uint8_t peer_ipv4[4],
+                                            uint32_t peer_seen_ms_ago,
+                                            const uint8_t *peer_payload, size_t peer_payload_len,
+                                            const uint8_t cluster_key[32]) {
+    if (peer_payload_len % ECHO_PAYLOAD_BLOCK_SIZE != 0) return ECHO_ERR_BAD_PAYLOAD_SIZE;
+    if (peer_payload_len > ECHO_PAYLOAD_MAX_BYTES) return ECHO_ERR_BAD_PAYLOAD_SIZE;
+    size_t n_blocks = peer_payload_len / ECHO_PAYLOAD_BLOCK_SIZE;
+    size_t pt_len = 6 + 4 + 4 + peer_payload_len;
+    size_t total = ECHO_HEADER_LEN + pt_len + ECHO_AEAD_TAG_LEN;
     if (total > ECHO_MTU_CAP) return ECHO_ERR_OVER_MTU;
     if (out_cap < total) return ECHO_ERR_BAD_LENGTH;
-    echo_header_t h = {
-        .msg_type = ECHO_MSG_STATUS_DETAIL, .flags = 0,
-        .sequence = seq, .timestamp_ms = ts_ms,
-        .payload_len = (uint16_t)pl,
-    };
-    memcpy(h.sender_id, sender_id, 8);
-    echo_header_pack(out, &h);
-    uint8_t *p = out + ECHO_HEADER_LEN;
-    w_u64(p, witness_uptime_ms); p += 8;
-    memcpy(p, target_sender_id, 8); p += 8;
-    *p++ = 0x00;  // status: found
-    *p++ = 0x00;  // reserved
-    memcpy(p, peer_ipv4, 4); p += 4;
-    w_u32(p, last_seen_seconds); p += 4;
-    *p++ = (uint8_t)peer_payload_len;
-    if (peer_payload_len) memcpy(p, peer_payload, peer_payload_len);
-    finalize_hmac(out, ECHO_HEADER_LEN + pl, cluster_key);
+
+    echo_header_t hdr = { .msg_type = ECHO_MSG_STATUS_DETAIL,
+                          .sender_id = ECHO_WITNESS_SENDER_ID,
+                          .timestamp_ms = timestamp_ms };
+    echo_header_pack(out, &hdr);
+
+    uint8_t pt[6 + 4 + 4 + ECHO_PAYLOAD_MAX_BYTES];
+    wr_u32_be(pt, witness_uptime_seconds);
+    pt[4] = target_sender_id;
+    pt[5] = (uint8_t)n_blocks;
+    memcpy(pt + 6, peer_ipv4, 4);
+    wr_u32_be(pt + 10, peer_seen_ms_ago);
+    if (peer_payload_len) memcpy(pt + 14, peer_payload, peer_payload_len);
+
+    uint8_t nonce[ECHO_AEAD_NONCE_LEN];
+    echo_derive_nonce(nonce, ECHO_WITNESS_SENDER_ID, timestamp_ms);
+    if (!echo_aead_encrypt(cluster_key, nonce, out, ECHO_HEADER_LEN,
+                           pt, pt_len, out + ECHO_HEADER_LEN)) {
+        return ECHO_ERR_AUTH_FAILED;
+    }
     *out_len = total;
     return ECHO_OK;
 }
 
-echo_err_t echo_encode_status_detail_not_found(
-    uint8_t *out, size_t out_cap, size_t *out_len,
-    const uint8_t sender_id[8], uint64_t seq, int64_t ts_ms,
-    uint64_t witness_uptime_ms, const uint8_t target_sender_id[8],
-    const uint8_t *cluster_key) {
-    size_t pl = 18;
-    size_t total = ECHO_HEADER_LEN + pl + 32;
+echo_err_t echo_encode_status_detail_not_found(uint8_t *out, size_t out_cap, size_t *out_len,
+                                                int64_t timestamp_ms,
+                                                uint32_t witness_uptime_seconds,
+                                                uint8_t target_sender_id,
+                                                const uint8_t cluster_key[32]) {
+    size_t pt_len = 6;
+    size_t total = ECHO_HEADER_LEN + pt_len + ECHO_AEAD_TAG_LEN;
     if (out_cap < total) return ECHO_ERR_BAD_LENGTH;
-    echo_header_t h = {
-        .msg_type = ECHO_MSG_STATUS_DETAIL, .flags = 0,
-        .sequence = seq, .timestamp_ms = ts_ms,
-        .payload_len = (uint16_t)pl,
-    };
-    memcpy(h.sender_id, sender_id, 8);
-    echo_header_pack(out, &h);
-    uint8_t *p = out + ECHO_HEADER_LEN;
-    w_u64(p, witness_uptime_ms); p += 8;
-    memcpy(p, target_sender_id, 8); p += 8;
-    *p++ = 0x01;
-    *p++ = 0x00;
-    finalize_hmac(out, ECHO_HEADER_LEN + pl, cluster_key);
+
+    echo_header_t hdr = { .msg_type = ECHO_MSG_STATUS_DETAIL,
+                          .sender_id = ECHO_WITNESS_SENDER_ID,
+                          .timestamp_ms = timestamp_ms };
+    echo_header_pack(out, &hdr);
+
+    uint8_t pt[6];
+    wr_u32_be(pt, witness_uptime_seconds);
+    pt[4] = target_sender_id;
+    pt[5] = ECHO_STATUS_DETAIL_NOT_FOUND_BIT;
+
+    uint8_t nonce[ECHO_AEAD_NONCE_LEN];
+    echo_derive_nonce(nonce, ECHO_WITNESS_SENDER_ID, timestamp_ms);
+    if (!echo_aead_encrypt(cluster_key, nonce, out, ECHO_HEADER_LEN,
+                           pt, pt_len, out + ECHO_HEADER_LEN)) {
+        return ECHO_ERR_AUTH_FAILED;
+    }
     *out_len = total;
     return ECHO_OK;
 }
 
-// ─── UNKNOWN_SOURCE 0x10 (unauthenticated) ──────────────────────────────────
+// ─── DISCOVER (0x04) ────────────────────────────────────────────────────────
+
+echo_err_t echo_encode_discover(uint8_t *out, size_t out_cap, size_t *out_len,
+                                 uint8_t sender_id, int64_t timestamp_ms) {
+    if (sender_id > ECHO_NODE_SENDER_ID_MAX) return ECHO_ERR_BAD_SENDER_ID;
+    if (out_cap < ECHO_DISCOVER_LEN) return ECHO_ERR_BAD_LENGTH;
+    echo_header_t hdr = { .msg_type = ECHO_MSG_DISCOVER,
+                          .sender_id = sender_id,
+                          .timestamp_ms = timestamp_ms };
+    echo_header_pack(out, &hdr);
+    *out_len = ECHO_DISCOVER_LEN;
+    return ECHO_OK;
+}
+
+echo_err_t echo_decode_discover(const uint8_t *buf, size_t buf_len,
+                                 echo_header_t *out_header) {
+    if (buf_len != ECHO_DISCOVER_LEN) return ECHO_ERR_BAD_LENGTH;
+    echo_err_t e = echo_header_unpack(out_header, buf, buf_len);
+    if (e != ECHO_OK) return e;
+    if (out_header->msg_type != ECHO_MSG_DISCOVER) return ECHO_ERR_BAD_MSG_TYPE;
+    if (out_header->sender_id > ECHO_NODE_SENDER_ID_MAX) return ECHO_ERR_BAD_SENDER_ID;
+    return ECHO_OK;
+}
+
+// ─── UNKNOWN_SOURCE (0x10) ──────────────────────────────────────────────────
 
 echo_err_t echo_encode_unknown_source(uint8_t *out, size_t out_cap, size_t *out_len,
-                                       const uint8_t sender_id[8],
-                                       uint64_t seq, int64_t ts_ms) {
-    if (out_cap < ECHO_HEADER_LEN) return ECHO_ERR_BAD_LENGTH;
-    echo_header_t h = {
-        .msg_type = ECHO_MSG_UNKNOWN_SOURCE, .flags = 0,
-        .sequence = seq, .timestamp_ms = ts_ms, .payload_len = 0,
-    };
-    memcpy(h.sender_id, sender_id, 8);
-    echo_header_pack(out, &h);
-    *out_len = ECHO_HEADER_LEN;
+                                       int64_t timestamp_ms,
+                                       const uint8_t witness_pubkey[32]) {
+    if (out_cap < ECHO_UNKNOWN_SOURCE_LEN) return ECHO_ERR_BAD_LENGTH;
+    echo_header_t hdr = { .msg_type = ECHO_MSG_UNKNOWN_SOURCE,
+                          .sender_id = ECHO_WITNESS_SENDER_ID,
+                          .timestamp_ms = timestamp_ms };
+    echo_header_pack(out, &hdr);
+    memcpy(out + ECHO_HEADER_LEN, witness_pubkey, 32);
+    *out_len = ECHO_UNKNOWN_SOURCE_LEN;
     return ECHO_OK;
 }
 
-// ─── BOOTSTRAP 0x20 (inbound on witness) ────────────────────────────────────
+// ─── BOOTSTRAP (0x20) ───────────────────────────────────────────────────────
 
-typedef struct {
-    echo_header_t hdr;
-    uint8_t cluster_key[ECHO_CLUSTER_KEY_LEN];
-    uint8_t init_payload[ECHO_BOOTSTRAP_INIT_PAYLOAD_MAX];
-    size_t init_payload_len;
-} echo_bootstrap_view_t;
-
-echo_err_t echo_decode_bootstrap(echo_bootstrap_view_t *out,
-                                  const uint8_t *buf, size_t len,
-                                  const uint8_t witness_priv[32]) {
-    if (len > ECHO_MTU_CAP) return ECHO_ERR_OVER_MTU;
-    echo_err_t e = echo_header_unpack(&out->hdr, buf, len);
-    if (e != ECHO_OK) return e;
-    if (out->hdr.msg_type != ECHO_MSG_BOOTSTRAP) return ECHO_ERR_BAD_MSG_TYPE;
-    if (len != (size_t)(ECHO_HEADER_LEN + out->hdr.payload_len))
-        return ECHO_ERR_BAD_LENGTH;
-    size_t pl = out->hdr.payload_len;
-    if (pl < 32 + 32 + 16) return ECHO_ERR_BAD_PAYLOAD_LEN;
-    if (pl > 32 + 32 + ECHO_BOOTSTRAP_INIT_PAYLOAD_MAX + 16)
-        return ECHO_ERR_BAD_PAYLOAD_LEN;
-    const uint8_t *payload = buf + ECHO_HEADER_LEN;
-    const uint8_t *eph_pub = payload;
-    const uint8_t *ct = payload + 32;
-    size_t ct_len = pl - 32;
-
+echo_err_t echo_encode_bootstrap(uint8_t *out, size_t out_cap, size_t *out_len,
+                                  uint8_t sender_id, int64_t timestamp_ms,
+                                  const uint8_t cluster_key[32],
+                                  const uint8_t witness_pubkey[32],
+                                  const uint8_t eph_priv[32]) {
+    if (sender_id > ECHO_NODE_SENDER_ID_MAX) return ECHO_ERR_BAD_SENDER_ID;
+    if (out_cap < ECHO_BOOTSTRAP_LEN) return ECHO_ERR_BAD_LENGTH;
+    uint8_t eph_pub[32];
+    if (!echo_x25519_pub_from_priv(eph_priv, eph_pub)) return ECHO_ERR_AUTH_FAILED;
     uint8_t shared[32];
-    if (!echo_x25519_shared(witness_priv, eph_pub, shared))
-        return ECHO_ERR_AUTH_FAILED;
+    if (!echo_x25519_shared(eph_priv, witness_pubkey, shared)) return ECHO_ERR_AUTH_FAILED;
+    uint8_t aead_key[32];
+    if (!echo_hkdf_sha256(shared, 32, aead_key)) return ECHO_ERR_AUTH_FAILED;
 
-    uint8_t derived[32];
-    if (!echo_hkdf_sha256(shared, 32, derived))
-        return ECHO_ERR_AUTH_FAILED;
+    echo_header_t hdr = { .msg_type = ECHO_MSG_BOOTSTRAP,
+                          .sender_id = sender_id,
+                          .timestamp_ms = timestamp_ms };
+    echo_header_pack(out, &hdr);
+    memcpy(out + ECHO_HEADER_LEN, eph_pub, 32);
 
-    // AAD = packet header bytes [0..32]. Decrypt into a local plaintext buffer.
-    uint8_t plaintext[32 + ECHO_BOOTSTRAP_INIT_PAYLOAD_MAX];
-    if (!echo_aead_decrypt(derived, buf, ECHO_HEADER_LEN, ct, ct_len, plaintext))
+    uint8_t nonce[ECHO_AEAD_NONCE_LEN] = {0};
+    if (!echo_aead_encrypt(aead_key, nonce, out, ECHO_HEADER_LEN,
+                           cluster_key, 32, out + ECHO_HEADER_LEN + 32)) {
         return ECHO_ERR_AUTH_FAILED;
-
-    size_t pt_len = ct_len - 16;
-    if (pt_len < 32) return ECHO_ERR_BAD_PAYLOAD_LEN;
-    memcpy(out->cluster_key, plaintext, 32);
-    size_t init_len = pt_len - 32;
-    if (init_len > ECHO_BOOTSTRAP_INIT_PAYLOAD_MAX) return ECHO_ERR_BAD_PAYLOAD_LEN;
-    out->init_payload_len = init_len;
-    if (init_len) memcpy(out->init_payload, plaintext + 32, init_len);
+    }
+    *out_len = ECHO_BOOTSTRAP_LEN;
     return ECHO_OK;
 }
 
-// ─── BOOTSTRAP_ACK 0x21 ────────────────────────────────────────────────────
+echo_err_t echo_decode_bootstrap(const uint8_t *buf, size_t buf_len,
+                                  const uint8_t witness_priv[32],
+                                  echo_header_t *out_header,
+                                  uint8_t out_cluster_key[32]) {
+    if (buf_len != ECHO_BOOTSTRAP_LEN) return ECHO_ERR_BAD_LENGTH;
+    echo_err_t e = echo_header_unpack(out_header, buf, buf_len);
+    if (e != ECHO_OK) return e;
+    if (out_header->msg_type != ECHO_MSG_BOOTSTRAP) return ECHO_ERR_BAD_MSG_TYPE;
+    if (out_header->sender_id > ECHO_NODE_SENDER_ID_MAX) return ECHO_ERR_BAD_SENDER_ID;
+
+    const uint8_t *eph_pub = buf + ECHO_HEADER_LEN;
+    uint8_t shared[32];
+    if (!echo_x25519_shared(witness_priv, eph_pub, shared)) return ECHO_ERR_AUTH_FAILED;
+    uint8_t aead_key[32];
+    if (!echo_hkdf_sha256(shared, 32, aead_key)) return ECHO_ERR_AUTH_FAILED;
+
+    uint8_t nonce[ECHO_AEAD_NONCE_LEN] = {0};
+    if (!echo_aead_decrypt(aead_key, nonce, buf, ECHO_HEADER_LEN,
+                           buf + ECHO_HEADER_LEN + 32, 32 + ECHO_AEAD_TAG_LEN,
+                           out_cluster_key)) {
+        return ECHO_ERR_AUTH_FAILED;
+    }
+    return ECHO_OK;
+}
+
+// ─── BOOTSTRAP_ACK (0x21) ───────────────────────────────────────────────────
 
 echo_err_t echo_encode_bootstrap_ack(uint8_t *out, size_t out_cap, size_t *out_len,
-                                      const uint8_t sender_id[8],
-                                      uint64_t seq, int64_t ts_ms,
-                                      uint8_t status, uint64_t witness_uptime_ms,
-                                      const uint8_t *cluster_key) {
-    if (status != 0 && status != 1) return ECHO_ERR_BAD_FIELD;
-    size_t pl = 9;
-    size_t total = ECHO_HEADER_LEN + pl + 32;
-    if (out_cap < total) return ECHO_ERR_BAD_LENGTH;
-    echo_header_t h = {
-        .msg_type = ECHO_MSG_BOOTSTRAP_ACK, .flags = 0,
-        .sequence = seq, .timestamp_ms = ts_ms,
-        .payload_len = (uint16_t)pl,
-    };
-    memcpy(h.sender_id, sender_id, 8);
-    echo_header_pack(out, &h);
-    out[ECHO_HEADER_LEN] = status;
-    w_u64(out + ECHO_HEADER_LEN + 1, witness_uptime_ms);
-    finalize_hmac(out, ECHO_HEADER_LEN + pl, cluster_key);
-    *out_len = total;
+                                      int64_t timestamp_ms, uint8_t status,
+                                      uint32_t witness_uptime_seconds,
+                                      const uint8_t cluster_key[32]) {
+    if (out_cap < ECHO_BOOTSTRAP_ACK_LEN) return ECHO_ERR_BAD_LENGTH;
+    echo_header_t hdr = { .msg_type = ECHO_MSG_BOOTSTRAP_ACK,
+                          .sender_id = ECHO_WITNESS_SENDER_ID,
+                          .timestamp_ms = timestamp_ms };
+    echo_header_pack(out, &hdr);
+
+    uint8_t pt[ECHO_BOOTSTRAP_ACK_PT_LEN];
+    pt[0] = status;
+    wr_u32_be(pt + 1, witness_uptime_seconds);
+
+    uint8_t nonce[ECHO_AEAD_NONCE_LEN];
+    echo_derive_nonce(nonce, ECHO_WITNESS_SENDER_ID, timestamp_ms);
+    if (!echo_aead_encrypt(cluster_key, nonce, out, ECHO_HEADER_LEN,
+                           pt, ECHO_BOOTSTRAP_ACK_PT_LEN, out + ECHO_HEADER_LEN)) {
+        return ECHO_ERR_AUTH_FAILED;
+    }
+    *out_len = ECHO_BOOTSTRAP_ACK_LEN;
     return ECHO_OK;
 }

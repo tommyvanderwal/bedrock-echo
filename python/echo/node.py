@@ -1,8 +1,12 @@
 """Bedrock Echo node-side client (v1).
 
-Stateful enough to track timestamps and auto-bootstrap on UNKNOWN_SOURCE.
+Stateful enough to track timestamps and auto-bootstrap on UNKNOWN_SOURCE
+or on heartbeat timeout (which can mean a rate-limited UNKNOWN_SOURCE
+that got silently dropped).
+
 The flow is HEARTBEAT-first: we try heartbeat, and only fall back to
-BOOTSTRAP if the witness replies UNKNOWN_SOURCE (per PROTOCOL.md §13).
+BOOTSTRAP if the witness replies UNKNOWN_SOURCE (per PROTOCOL.md §13)
+or doesn't reply at all (likely rate-limited).
 """
 from __future__ import annotations
 
@@ -105,7 +109,22 @@ class NodeClient:
             query_target_id=target,
             own_payload=own_payload,
         )
-        reply = self._sendrecv(hb.encode(self.cluster_key))
+        try:
+            reply = self._sendrecv(hb.encode(self.cluster_key))
+        except (TimeoutError, socket.timeout):
+            # Witness might be rate-limiting UNKNOWN_SOURCE. Bootstrap
+            # unconditionally and retry. The bootstrap is authenticated via
+            # ECDH to witness_pubkey, so a rogue witness can't trick us.
+            log.info("heartbeat timed out (likely rate-limited UNKNOWN_SOURCE); bootstrapping")
+            self.bootstrap()
+            hb = proto.Heartbeat(
+                sender_id=self.sender_id,
+                timestamp_ms=self._next_ts(),
+                query_target_id=target,
+                own_payload=own_payload,
+            )
+            return self._sendrecv(hb.encode(self.cluster_key))
+
         # If it's UNKNOWN_SOURCE, bootstrap once then retry.
         if len(reply) == proto.UNKNOWN_SOURCE_LEN and reply[4] == proto.MSG_UNKNOWN_SOURCE:
             us = proto.decode_unknown_source(reply)

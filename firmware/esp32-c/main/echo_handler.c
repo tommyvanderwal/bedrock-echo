@@ -1,12 +1,15 @@
-// Witness packet dispatcher (ESP32 v1).
+// Witness packet dispatcher (ESP32 v1, post-polish).
 //
-// Pure logic. Drives the v1 lookup chain:
-//   1. IP-first + sender_id    → AEAD trial decrypt against cluster_keys
-//   2. Fallback: sender_id only (handles IP change)
-//   3. Fallback: AEAD trial against every cluster_key (new-node-join scan)
+// v1 dispatch:
+//   - DISCOVER → INIT (with cookie for src_ip, anti-amp 1.0× factor).
+//   - BOOTSTRAP → cookie pre-check, then AEAD-decrypt cluster_key.
+//   - HEARTBEAT → strict (src_ip, sender_id) match only. No
+//     sender_id-only fallback, no new-node-join AEAD scan. Mismatches
+//     get a rate-limited INIT reply.
 
 #include "echo.h"
 #include <string.h>
+#include "esp_random.h"
 
 // Outcome of a single AEAD trial in the dispatch chain.
 typedef enum {
@@ -37,6 +40,12 @@ bool echo_handle_packet(echo_state_t *state,
                         uint8_t *out, size_t out_cap, size_t *out_len) {
     if (data_len > ECHO_MTU_CAP || data_len < ECHO_HEADER_LEN) return false;
     echo_state_age_out(state, now_ms);
+    // Lazy hourly cookie-secret rotation. esp_random.h provides a CSPRNG.
+    if (echo_state_cookie_rotation_due(state, now_ms)) {
+        uint8_t new_secret[ECHO_WITNESS_COOKIE_SECRET_LEN];
+        esp_fill_random(new_secret, ECHO_WITNESS_COOKIE_SECRET_LEN);
+        echo_state_maybe_rotate_cookie(state, now_ms, new_secret);
+    }
     if (!echo_state_allow(state, src_ipv4, now_ms)) return false;
 
     echo_header_t hdr;
@@ -67,8 +76,10 @@ static bool handle_discover(echo_state_t *state,
     if (echo_decode_discover(data, data_len, &hdr) != ECHO_OK) return false;
     if (!echo_state_allow_unknown(state, src_ipv4, now_ms)) return false;
     int64_t ts_out = (int64_t)echo_state_uptime_ms(state, now_ms);
-    return echo_encode_unknown_source(out, out_cap, out_len, ts_out,
-                                       state->witness_pub) == ECHO_OK;
+    uint8_t cookie[ECHO_COOKIE_LEN];
+    echo_state_cookie_for(state, src_ipv4, cookie);
+    return echo_encode_init(out, out_cap, out_len, ts_out,
+                            state->witness_pub, cookie) == ECHO_OK;
 }
 
 // ─── BOOTSTRAP ─────────────────────────────────────────────────────────────
@@ -78,12 +89,20 @@ static bool handle_bootstrap(echo_state_t *state,
                               const uint8_t src_ipv4[4], uint16_t src_port,
                               uint64_t now_ms,
                               uint8_t *out, size_t out_cap, size_t *out_len) {
+    if (data_len != ECHO_BOOTSTRAP_LEN) return false;
+    // Cookie pre-check (PROTOCOL.md §11.2). Cheap MAC; skip the AEAD/X25519
+    // work on stale or forged cookies.
+    const uint8_t *cookie_in = data + ECHO_HEADER_LEN;
+    if (!echo_state_cookie_valid(state, src_ipv4, cookie_in)) return false;
+
     echo_header_t hdr;
+    uint8_t cookie_dec[ECHO_COOKIE_LEN];
     uint8_t cluster_key[32];
     if (echo_decode_bootstrap(data, data_len, state->witness_priv,
-                               &hdr, cluster_key) != ECHO_OK) {
+                               &hdr, cookie_dec, cluster_key) != ECHO_OK) {
         return false;
     }
+    (void)cookie_dec; // already pre-checked above; the AAD coverage is belt-and-suspenders
     uint64_t uptime_ms = echo_state_uptime_ms(state, now_ms);
 
     // Look for existing entry with same (sender_id, cluster_key).
@@ -297,60 +316,6 @@ static hb_outcome_t try_existing_node(echo_state_t *state,
                                   out, out_cap, out_len) ? HB_REPLY : HB_DROP;
 }
 
-static hb_outcome_t try_new_node(echo_state_t *state,
-                                  const uint8_t *data, size_t data_len,
-                                  const uint8_t src_ipv4[4], uint16_t src_port,
-                                  uint64_t now_ms,
-                                  uint8_t sender_id, uint16_t cluster_slot,
-                                  const uint8_t cluster_key[32],
-                                  uint8_t *out, size_t out_cap, size_t *out_len) {
-    echo_header_t hdr;
-    uint8_t qt;
-    static uint8_t pt_scratch[ECHO_PAYLOAD_MAX_BYTES + 2];
-    const uint8_t *payload;
-    size_t payload_len;
-    if (echo_decode_heartbeat(data, data_len, cluster_key, &hdr, &qt,
-                               pt_scratch, sizeof(pt_scratch),
-                               &payload, &payload_len) != ECHO_OK) {
-        return HB_NOT_MINE;
-    }
-
-    // Belt-and-suspenders: don't re-add an existing entry.
-    for (size_t i = 0; i < ECHO_MAX_NODES; ++i) {
-        if (state->nodes[i].in_use
-            && state->nodes[i].sender_id == sender_id
-            && state->nodes[i].cluster_slot == cluster_slot) {
-            return HB_DROP;
-        }
-    }
-
-    uint64_t uptime_ms = echo_state_uptime_ms(state, now_ms);
-    if (!echo_state_adapt_offset(state, cluster_slot, hdr.timestamp_ms, uptime_ms))
-        return HB_DROP;
-
-    int ns_int = echo_state_alloc_node_slot(state);
-    if (ns_int < 0) return HB_DROP;
-
-    uint16_t first; uint8_t blocks;
-    if (!allocate_payload(state, payload, payload_len, &first, &blocks))
-        return HB_DROP;
-
-    echo_node_entry_t *n = &state->nodes[ns_int];
-    n->in_use = true;
-    n->sender_id = sender_id;
-    memcpy(n->sender_ipv4, src_ipv4, 4);
-    n->sender_src_port = src_port;
-    n->cluster_slot = cluster_slot;
-    n->last_rx_ms = now_ms;
-    n->last_rx_timestamp = hdr.timestamp_ms;
-    n->payload_first_block = first;
-    n->payload_n_blocks = blocks;
-    state->clusters[cluster_slot].num_nodes++;
-
-    return build_heartbeat_reply(state, cluster_slot, qt, uptime_ms,
-                                  out, out_cap, out_len) ? HB_REPLY : HB_DROP;
-}
-
 static bool handle_heartbeat(echo_state_t *state,
                               const uint8_t *data, size_t data_len,
                               const uint8_t src_ipv4[4], uint16_t src_port,
@@ -360,49 +325,29 @@ static bool handle_heartbeat(echo_state_t *state,
     if (echo_header_unpack(&hdr, data, data_len) != ECHO_OK) return false;
     uint8_t sid = hdr.sender_id;
 
-    // Pass 1: candidates by (src_ip, sender_id), then sender_id only.
-    size_t candidates[ECHO_MAX_NODES];
-    size_t n_candidates = 0;
-    for (size_t i = 0; i < ECHO_MAX_NODES && n_candidates == 0; ++i) {
-        if (state->nodes[i].in_use
-            && state->nodes[i].sender_id == sid
-            && memcmp(state->nodes[i].sender_ipv4, src_ipv4, 4) == 0) {
-            candidates[n_candidates++] = i;
-        }
-    }
-    if (n_candidates == 0) {
-        for (size_t i = 0; i < ECHO_MAX_NODES; ++i) {
-            if (state->nodes[i].in_use && state->nodes[i].sender_id == sid) {
-                candidates[n_candidates++] = i;
-            }
-        }
-    }
+    // Strict (src_ip, sender_id) match only. No sender_id-only fallback,
+    // no new-node-join scan — both removed in v1 polish.
+    for (size_t i = 0; i < ECHO_MAX_NODES; ++i) {
+        if (!state->nodes[i].in_use) continue;
+        if (state->nodes[i].sender_id != sid) continue;
+        if (memcmp(state->nodes[i].sender_ipv4, src_ipv4, 4) != 0) continue;
 
-    for (size_t k = 0; k < n_candidates; ++k) {
-        uint16_t cs = state->nodes[candidates[k]].cluster_slot;
+        uint16_t cs = state->nodes[i].cluster_slot;
         const uint8_t *ck = state->clusters[cs].cluster_key;
         hb_outcome_t r = try_existing_node(state, data, data_len, src_ipv4, src_port,
-                                            now_ms, candidates[k], cs, ck,
+                                            now_ms, i, cs, ck,
                                             out, out_cap, out_len);
         if (r == HB_REPLY) return true;
-        if (r == HB_DROP) return false;
-        // HB_NOT_MINE — try next candidate
+        // HB_NOT_MINE or HB_DROP both end the dispatch — there can only
+        // be one (src_ip, sender_id) entry, so no other candidate to try.
+        return false;
     }
 
-    // Pass 2: new-node-join scan against every cluster_key.
-    for (size_t cs = 0; cs < ECHO_MAX_CLUSTERS; ++cs) {
-        if (!state->clusters[cs].in_use) continue;
-        const uint8_t *ck = state->clusters[cs].cluster_key;
-        hb_outcome_t r = try_new_node(state, data, data_len, src_ipv4, src_port,
-                                       now_ms, sid, (uint16_t)cs, ck,
-                                       out, out_cap, out_len);
-        if (r == HB_REPLY) return true;
-        if (r == HB_DROP) return false;
-    }
-
-    // Nothing matched — UNKNOWN_SOURCE if rate limit allows.
+    // No entry. Reply INIT (with fresh cookie) so caller can re-BOOTSTRAP.
     if (!echo_state_allow_unknown(state, src_ipv4, now_ms)) return false;
     int64_t ts_out = (int64_t)echo_state_uptime_ms(state, now_ms);
-    return echo_encode_unknown_source(out, out_cap, out_len, ts_out,
-                                       state->witness_pub) == ECHO_OK;
+    uint8_t cookie[ECHO_COOKIE_LEN];
+    echo_state_cookie_for(state, src_ipv4, cookie);
+    return echo_encode_init(out, out_cap, out_len, ts_out,
+                            state->witness_pub, cookie) == ECHO_OK;
 }

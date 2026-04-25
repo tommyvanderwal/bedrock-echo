@@ -19,7 +19,7 @@
 #define ECHO_MSG_STATUS_LIST    0x02u
 #define ECHO_MSG_STATUS_DETAIL  0x03u
 #define ECHO_MSG_DISCOVER       0x04u
-#define ECHO_MSG_UNKNOWN_SOURCE 0x10u
+#define ECHO_MSG_INIT           0x10u
 #define ECHO_MSG_BOOTSTRAP      0x20u
 #define ECHO_MSG_BOOTSTRAP_ACK  0x21u
 
@@ -44,11 +44,19 @@
 #define ECHO_EPH_PUBKEY_LEN 32u
 #define ECHO_WITNESS_PUBKEY_LEN 32u
 
+// Anti-spoof cookie (PROTOCOL.md §11.2)
+#define ECHO_COOKIE_LEN 16u
+#define ECHO_WITNESS_COOKIE_SECRET_LEN 32u
+#define ECHO_COOKIE_ROTATION_MS (3600u * 1000u)  // 1 hour
+
+// DISCOVER zero-padding (anti-amp; PROTOCOL.md §1 principle 13, §5.4)
+#define ECHO_DISCOVER_PAD_LEN 48u
+
 // Total fixed-size packets
-#define ECHO_DISCOVER_LEN ECHO_HEADER_LEN
-#define ECHO_UNKNOWN_SOURCE_LEN (ECHO_HEADER_LEN + ECHO_WITNESS_PUBKEY_LEN)  // 46
+#define ECHO_DISCOVER_LEN (ECHO_HEADER_LEN + ECHO_DISCOVER_PAD_LEN)  // 62
+#define ECHO_INIT_LEN (ECHO_HEADER_LEN + ECHO_WITNESS_PUBKEY_LEN + ECHO_COOKIE_LEN)  // 62
 #define ECHO_BOOTSTRAP_LEN \
-    (ECHO_HEADER_LEN + ECHO_EPH_PUBKEY_LEN + ECHO_CLUSTER_KEY_LEN + ECHO_AEAD_TAG_LEN)  // 94
+    (ECHO_HEADER_LEN + ECHO_COOKIE_LEN + ECHO_EPH_PUBKEY_LEN + ECHO_CLUSTER_KEY_LEN + ECHO_AEAD_TAG_LEN)  // 110
 #define ECHO_BOOTSTRAP_ACK_PT_LEN 5u
 #define ECHO_BOOTSTRAP_ACK_LEN \
     (ECHO_HEADER_LEN + ECHO_BOOTSTRAP_ACK_PT_LEN + ECHO_AEAD_TAG_LEN)  // 35
@@ -127,6 +135,12 @@ bool echo_x25519_shared(const uint8_t priv[32], const uint8_t peer_pub[32],
 
 bool echo_hkdf_sha256(const uint8_t *ikm, size_t ikm_len, uint8_t out[32]);
 
+// Anti-spoof cookie (PROTOCOL.md §11.2):
+//     cookie = SHA-256(witness_cookie_secret || src_ip_be)[:16]
+void echo_derive_cookie(const uint8_t witness_cookie_secret[32],
+                        const uint8_t src_ip_be[4],
+                        uint8_t out[ECHO_COOKIE_LEN]);
+
 // ChaCha20-Poly1305. encrypt: writes ct||tag (pt_len + 16 bytes) into out.
 bool echo_aead_encrypt(const uint8_t key[32],
                        const uint8_t nonce[ECHO_AEAD_NONCE_LEN],
@@ -178,9 +192,40 @@ typedef struct echo_state_s {
     echo_node_entry_t nodes[ECHO_MAX_NODES];
     echo_rate_entry_t rate_limits[ECHO_MAX_TRACKED_IPS];
     uint8_t pool[ECHO_POOL_BYTES];
+    // Anti-spoof cookie state (PROTOCOL.md §11.2). Witness rotates the
+    // current secret hourly; both current and previous are valid for
+    // incoming BOOTSTRAPs.
+    uint8_t cookie_current[ECHO_WITNESS_COOKIE_SECRET_LEN];
+    uint8_t cookie_previous[ECHO_WITNESS_COOKIE_SECRET_LEN];
+    uint64_t last_cookie_rotation_ms;
 } echo_state_t;
 
 void echo_state_init(echo_state_t *state, const uint8_t priv[32], uint64_t now_ms);
+
+// Cookie state — caller supplies fresh randomness for the secret(s).
+// In production `echo_state_init` populates these via the platform RNG;
+// this entry point allows tests / repro to use deterministic secrets.
+void echo_state_init_with_cookies(echo_state_t *state,
+                                   const uint8_t priv[32],
+                                   uint64_t now_ms,
+                                   const uint8_t cookie_current[32],
+                                   const uint8_t cookie_previous[32]);
+
+// Lazy hourly rotation. Call frequently; `new_secret` is consumed only
+// when a rotation actually happens (≥ 1h since the last).
+bool echo_state_cookie_rotation_due(const echo_state_t *state, uint64_t now_ms);
+void echo_state_maybe_rotate_cookie(echo_state_t *state, uint64_t now_ms,
+                                    const uint8_t new_secret[32]);
+
+// Compute the cookie a node at src_ip should echo on its next BOOTSTRAP.
+void echo_state_cookie_for(const echo_state_t *state,
+                            const uint8_t src_ip[4],
+                            uint8_t out[ECHO_COOKIE_LEN]);
+// Validate `cookie` against current OR previous secret.
+bool echo_state_cookie_valid(const echo_state_t *state,
+                              const uint8_t src_ip[4],
+                              const uint8_t cookie[ECHO_COOKIE_LEN]);
+
 uint64_t echo_state_uptime_ms(const echo_state_t *state, uint64_t now_ms);
 void echo_state_age_out(echo_state_t *state, uint64_t now_ms);
 bool echo_state_allow(echo_state_t *state, const uint8_t ipv4[4], uint64_t now_ms);
@@ -265,20 +310,23 @@ echo_err_t echo_encode_discover(uint8_t *out, size_t out_cap, size_t *out_len,
 echo_err_t echo_decode_discover(const uint8_t *buf, size_t buf_len,
                                  echo_header_t *out_header);
 
-// UNKNOWN_SOURCE
-echo_err_t echo_encode_unknown_source(uint8_t *out, size_t out_cap, size_t *out_len,
-                                       int64_t timestamp_ms,
-                                       const uint8_t witness_pubkey[32]);
+// INIT (renamed from UNKNOWN_SOURCE in v1 polish; carries cookie)
+echo_err_t echo_encode_init(uint8_t *out, size_t out_cap, size_t *out_len,
+                             int64_t timestamp_ms,
+                             const uint8_t witness_pubkey[32],
+                             const uint8_t cookie[ECHO_COOKIE_LEN]);
 
-// BOOTSTRAP
+// BOOTSTRAP — carries 16 B cookie in AAD (PROTOCOL.md §5.6).
 echo_err_t echo_encode_bootstrap(uint8_t *out, size_t out_cap, size_t *out_len,
                                   uint8_t sender_id, int64_t timestamp_ms,
                                   const uint8_t cluster_key[32],
                                   const uint8_t witness_pubkey[32],
-                                  const uint8_t eph_priv[32]);
+                                  const uint8_t eph_priv[32],
+                                  const uint8_t cookie[ECHO_COOKIE_LEN]);
 echo_err_t echo_decode_bootstrap(const uint8_t *buf, size_t buf_len,
                                   const uint8_t witness_priv[32],
                                   echo_header_t *out_header,
+                                  uint8_t out_cookie[ECHO_COOKIE_LEN],
                                   uint8_t out_cluster_key[32]);
 
 // BOOTSTRAP_ACK

@@ -11,11 +11,63 @@
 
 // ─── State init ─────────────────────────────────────────────────────────────
 
+#include "esp_random.h"
+
 void echo_state_init(echo_state_t *state, const uint8_t priv[32], uint64_t now_ms) {
     memset(state, 0, sizeof(*state));
     memcpy(state->witness_priv, priv, 32);
     echo_x25519_pub_from_priv(priv, state->witness_pub);
     state->start_ms = now_ms;
+    // Generate two random cookie secrets at boot (current + previous both
+    // fresh, so any in-flight cookies from a previous witness session are
+    // invalidated). esp_random.h provides a CSPRNG.
+    esp_fill_random(state->cookie_current,  ECHO_WITNESS_COOKIE_SECRET_LEN);
+    esp_fill_random(state->cookie_previous, ECHO_WITNESS_COOKIE_SECRET_LEN);
+    state->last_cookie_rotation_ms = now_ms;
+}
+
+void echo_state_init_with_cookies(echo_state_t *state,
+                                   const uint8_t priv[32],
+                                   uint64_t now_ms,
+                                   const uint8_t cookie_current[32],
+                                   const uint8_t cookie_previous[32]) {
+    memset(state, 0, sizeof(*state));
+    memcpy(state->witness_priv, priv, 32);
+    echo_x25519_pub_from_priv(priv, state->witness_pub);
+    state->start_ms = now_ms;
+    memcpy(state->cookie_current,  cookie_current,  32);
+    memcpy(state->cookie_previous, cookie_previous, 32);
+    state->last_cookie_rotation_ms = now_ms;
+}
+
+// ─── Cookie rotation + validation ──────────────────────────────────────────
+
+bool echo_state_cookie_rotation_due(const echo_state_t *state, uint64_t now_ms) {
+    return (now_ms - state->last_cookie_rotation_ms) >= ECHO_COOKIE_ROTATION_MS;
+}
+
+void echo_state_maybe_rotate_cookie(echo_state_t *state, uint64_t now_ms,
+                                    const uint8_t new_secret[32]) {
+    if (!echo_state_cookie_rotation_due(state, now_ms)) return;
+    memcpy(state->cookie_previous, state->cookie_current, 32);
+    memcpy(state->cookie_current,  new_secret,            32);
+    state->last_cookie_rotation_ms = now_ms;
+}
+
+void echo_state_cookie_for(const echo_state_t *state,
+                            const uint8_t src_ip[4],
+                            uint8_t out[ECHO_COOKIE_LEN]) {
+    echo_derive_cookie(state->cookie_current, src_ip, out);
+}
+
+bool echo_state_cookie_valid(const echo_state_t *state,
+                              const uint8_t src_ip[4],
+                              const uint8_t cookie[ECHO_COOKIE_LEN]) {
+    uint8_t expected[ECHO_COOKIE_LEN];
+    echo_derive_cookie(state->cookie_current, src_ip, expected);
+    if (memcmp(cookie, expected, ECHO_COOKIE_LEN) == 0) return true;
+    echo_derive_cookie(state->cookie_previous, src_ip, expected);
+    return memcmp(cookie, expected, ECHO_COOKIE_LEN) == 0;
 }
 
 uint64_t echo_state_uptime_ms(const echo_state_t *state, uint64_t now_ms) {

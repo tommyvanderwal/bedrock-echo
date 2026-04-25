@@ -32,7 +32,7 @@ static bool is_known_msg_type(uint8_t t) {
         case ECHO_MSG_STATUS_LIST:
         case ECHO_MSG_STATUS_DETAIL:
         case ECHO_MSG_DISCOVER:
-        case ECHO_MSG_UNKNOWN_SOURCE:
+        case ECHO_MSG_INIT:
         case ECHO_MSG_BOOTSTRAP:
         case ECHO_MSG_BOOTSTRAP_ACK:
             return true;
@@ -246,7 +246,7 @@ echo_err_t echo_encode_status_detail_not_found(uint8_t *out, size_t out_cap, siz
     return ECHO_OK;
 }
 
-// ─── DISCOVER (0x04) ────────────────────────────────────────────────────────
+// ─── DISCOVER (0x04) — zero-padded to 62 B for anti-amplification ─────────
 
 echo_err_t echo_encode_discover(uint8_t *out, size_t out_cap, size_t *out_len,
                                  uint8_t sender_id, int64_t timestamp_ms) {
@@ -256,6 +256,8 @@ echo_err_t echo_encode_discover(uint8_t *out, size_t out_cap, size_t *out_len,
                           .sender_id = sender_id,
                           .timestamp_ms = timestamp_ms };
     echo_header_pack(out, &hdr);
+    // Bytes 14..62: MUST be zero on send (PROTOCOL.md §5.4).
+    memset(out + ECHO_HEADER_LEN, 0, ECHO_DISCOVER_PAD_LEN);
     *out_len = ECHO_DISCOVER_LEN;
     return ECHO_OK;
 }
@@ -267,31 +269,36 @@ echo_err_t echo_decode_discover(const uint8_t *buf, size_t buf_len,
     if (e != ECHO_OK) return e;
     if (out_header->msg_type != ECHO_MSG_DISCOVER) return ECHO_ERR_BAD_MSG_TYPE;
     if (out_header->sender_id > ECHO_NODE_SENDER_ID_MAX) return ECHO_ERR_BAD_SENDER_ID;
+    // Padding bytes are MAY-check; we don't enforce zero-only so future
+    // forward-compat use of those bytes via msg_type extension stays open.
     return ECHO_OK;
 }
 
-// ─── UNKNOWN_SOURCE (0x10) ──────────────────────────────────────────────────
+// ─── INIT (0x10) — witness reply, carries pubkey + 16 B cookie ────────────
 
-echo_err_t echo_encode_unknown_source(uint8_t *out, size_t out_cap, size_t *out_len,
-                                       int64_t timestamp_ms,
-                                       const uint8_t witness_pubkey[32]) {
-    if (out_cap < ECHO_UNKNOWN_SOURCE_LEN) return ECHO_ERR_BAD_LENGTH;
-    echo_header_t hdr = { .msg_type = ECHO_MSG_UNKNOWN_SOURCE,
+echo_err_t echo_encode_init(uint8_t *out, size_t out_cap, size_t *out_len,
+                             int64_t timestamp_ms,
+                             const uint8_t witness_pubkey[32],
+                             const uint8_t cookie[ECHO_COOKIE_LEN]) {
+    if (out_cap < ECHO_INIT_LEN) return ECHO_ERR_BAD_LENGTH;
+    echo_header_t hdr = { .msg_type = ECHO_MSG_INIT,
                           .sender_id = ECHO_WITNESS_SENDER_ID,
                           .timestamp_ms = timestamp_ms };
     echo_header_pack(out, &hdr);
     memcpy(out + ECHO_HEADER_LEN, witness_pubkey, 32);
-    *out_len = ECHO_UNKNOWN_SOURCE_LEN;
+    memcpy(out + ECHO_HEADER_LEN + 32, cookie, ECHO_COOKIE_LEN);
+    *out_len = ECHO_INIT_LEN;
     return ECHO_OK;
 }
 
-// ─── BOOTSTRAP (0x20) ───────────────────────────────────────────────────────
+// ─── BOOTSTRAP (0x20) — AAD = header || cookie (30 bytes) ────────────────
 
 echo_err_t echo_encode_bootstrap(uint8_t *out, size_t out_cap, size_t *out_len,
                                   uint8_t sender_id, int64_t timestamp_ms,
                                   const uint8_t cluster_key[32],
                                   const uint8_t witness_pubkey[32],
-                                  const uint8_t eph_priv[32]) {
+                                  const uint8_t eph_priv[32],
+                                  const uint8_t cookie[ECHO_COOKIE_LEN]) {
     if (sender_id > ECHO_NODE_SENDER_ID_MAX) return ECHO_ERR_BAD_SENDER_ID;
     if (out_cap < ECHO_BOOTSTRAP_LEN) return ECHO_ERR_BAD_LENGTH;
     uint8_t eph_pub[32];
@@ -305,11 +312,15 @@ echo_err_t echo_encode_bootstrap(uint8_t *out, size_t out_cap, size_t *out_len,
                           .sender_id = sender_id,
                           .timestamp_ms = timestamp_ms };
     echo_header_pack(out, &hdr);
-    memcpy(out + ECHO_HEADER_LEN, eph_pub, 32);
+    memcpy(out + ECHO_HEADER_LEN, cookie, ECHO_COOKIE_LEN);
+    const size_t aad_len = ECHO_HEADER_LEN + ECHO_COOKIE_LEN;        // 30
+    const size_t eph_off = aad_len;                                   // 30
+    const size_t ct_off  = eph_off + 32;                              // 62
+    memcpy(out + eph_off, eph_pub, 32);
 
     uint8_t nonce[ECHO_AEAD_NONCE_LEN] = {0};
-    if (!echo_aead_encrypt(aead_key, nonce, out, ECHO_HEADER_LEN,
-                           cluster_key, 32, out + ECHO_HEADER_LEN + 32)) {
+    if (!echo_aead_encrypt(aead_key, nonce, out, aad_len,
+                           cluster_key, 32, out + ct_off)) {
         return ECHO_ERR_AUTH_FAILED;
     }
     *out_len = ECHO_BOOTSTRAP_LEN;
@@ -319,6 +330,7 @@ echo_err_t echo_encode_bootstrap(uint8_t *out, size_t out_cap, size_t *out_len,
 echo_err_t echo_decode_bootstrap(const uint8_t *buf, size_t buf_len,
                                   const uint8_t witness_priv[32],
                                   echo_header_t *out_header,
+                                  uint8_t out_cookie[ECHO_COOKIE_LEN],
                                   uint8_t out_cluster_key[32]) {
     if (buf_len != ECHO_BOOTSTRAP_LEN) return ECHO_ERR_BAD_LENGTH;
     echo_err_t e = echo_header_unpack(out_header, buf, buf_len);
@@ -326,15 +338,20 @@ echo_err_t echo_decode_bootstrap(const uint8_t *buf, size_t buf_len,
     if (out_header->msg_type != ECHO_MSG_BOOTSTRAP) return ECHO_ERR_BAD_MSG_TYPE;
     if (out_header->sender_id > ECHO_NODE_SENDER_ID_MAX) return ECHO_ERR_BAD_SENDER_ID;
 
-    const uint8_t *eph_pub = buf + ECHO_HEADER_LEN;
+    memcpy(out_cookie, buf + ECHO_HEADER_LEN, ECHO_COOKIE_LEN);
+    const size_t aad_len = ECHO_HEADER_LEN + ECHO_COOKIE_LEN;
+    const size_t eph_off = aad_len;
+    const size_t ct_off  = eph_off + 32;
+
+    const uint8_t *eph_pub = buf + eph_off;
     uint8_t shared[32];
     if (!echo_x25519_shared(witness_priv, eph_pub, shared)) return ECHO_ERR_AUTH_FAILED;
     uint8_t aead_key[32];
     if (!echo_hkdf_sha256(shared, 32, aead_key)) return ECHO_ERR_AUTH_FAILED;
 
     uint8_t nonce[ECHO_AEAD_NONCE_LEN] = {0};
-    if (!echo_aead_decrypt(aead_key, nonce, buf, ECHO_HEADER_LEN,
-                           buf + ECHO_HEADER_LEN + 32, 32 + ECHO_AEAD_TAG_LEN,
+    if (!echo_aead_decrypt(aead_key, nonce, buf, aad_len,
+                           buf + ct_off, 32 + ECHO_AEAD_TAG_LEN,
                            out_cluster_key)) {
         return ECHO_ERR_AUTH_FAILED;
     }

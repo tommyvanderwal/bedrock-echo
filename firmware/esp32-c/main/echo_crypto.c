@@ -195,6 +195,23 @@ bool echo_hkdf_sha256(const uint8_t *ikm, size_t ikm_len, uint8_t out[32]) {
                         out, 32) == 0;
 }
 
+// ─── Anti-spoof cookie (PROTOCOL.md §11.2) ──────────────────────────────────
+// cookie = SHA-256(witness_cookie_secret || src_ip_be)[:16]
+
+void echo_derive_cookie(const uint8_t witness_cookie_secret[32],
+                        const uint8_t src_ip_be[4],
+                        uint8_t out[ECHO_COOKIE_LEN]) {
+    uint8_t digest[32];
+    mbedtls_sha256_context ctx;
+    mbedtls_sha256_init(&ctx);
+    mbedtls_sha256_starts(&ctx, 0);  // 0 = SHA-256 (not -224)
+    mbedtls_sha256_update(&ctx, witness_cookie_secret, 32);
+    mbedtls_sha256_update(&ctx, src_ip_be, 4);
+    mbedtls_sha256_finish(&ctx, digest);
+    mbedtls_sha256_free(&ctx);
+    memcpy(out, digest, ECHO_COOKIE_LEN);
+}
+
 // ─── ChaCha20-Poly1305 ──────────────────────────────────────────────────────
 
 bool echo_aead_encrypt(const uint8_t key[32],

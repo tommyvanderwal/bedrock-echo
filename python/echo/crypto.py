@@ -1,16 +1,16 @@
-"""Crypto primitives used by Bedrock Echo.
+"""Crypto primitives used by Bedrock Echo v1.
 
-Keep this module tiny — one thin layer over `cryptography`. Everything uses
-the primitives named in PROTOCOL.md §5:
-  - X25519         key agreement
-  - HKDF-SHA256    derive AEAD key from ECDH output
-  - ChaCha20-Poly1305 AEAD for BOOTSTRAP payload
-  - HMAC-SHA256    authentication of steady-state traffic
+Three primitives, all common-denominator across languages:
+  - X25519              key agreement (BOOTSTRAP)
+  - HKDF-SHA256         derive AEAD key from ECDH output (BOOTSTRAP)
+  - ChaCha20-Poly1305   AEAD on every authenticated message
+
+HMAC-SHA256 has been removed in v1 — AEAD's Poly1305 tag provides
+integrity for all authenticated messages, so the HMAC trailer is no
+longer needed.
 """
 from __future__ import annotations
 
-import hmac as _hmac
-import hashlib
 import os
 
 from cryptography.hazmat.primitives import hashes, serialization
@@ -21,9 +21,13 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import (
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
-HKDF_INFO = b"bedrock-echo v1 bootstrap"
+# HKDF parameters for BOOTSTRAP key derivation (PROTOCOL.md §4.3).
+HKDF_INFO = b"bedrock-echo bootstrap"
 HKDF_SALT = b"\x00" * 32
-AEAD_NONCE = b"\x00" * 12
+
+# BOOTSTRAP uses a fixed zero nonce — safe because aead_key is unique
+# per packet (derived from a fresh ephemeral keypair).
+BOOTSTRAP_AEAD_NONCE = b"\x00" * 12
 
 
 def x25519_generate() -> tuple[bytes, bytes]:
@@ -51,6 +55,11 @@ def x25519_pub_from_priv(priv: bytes) -> bytes:
 
 
 def x25519_shared(priv: bytes, peer_pub: bytes) -> bytes:
+    """Compute the X25519 ECDH shared secret.
+
+    Per RFC 7748, all-zero shared secrets indicate the peer used a
+    small-subgroup point. The cryptography library raises in that case.
+    """
     sk = X25519PrivateKey.from_private_bytes(priv)
     pk = X25519PublicKey.from_public_bytes(peer_pub)
     return sk.exchange(pk)
@@ -66,24 +75,14 @@ def hkdf_sha256(ikm: bytes, length: int = 32,
     ).derive(ikm)
 
 
-def aead_encrypt(key: bytes, aad: bytes, plaintext: bytes,
-                 nonce: bytes = AEAD_NONCE) -> bytes:
-    """Return ciphertext || 16-byte Poly1305 tag."""
+def aead_encrypt(key: bytes, nonce: bytes, aad: bytes, plaintext: bytes) -> bytes:
+    """ChaCha20-Poly1305 encrypt. Returns ciphertext || 16-byte tag."""
     return ChaCha20Poly1305(key).encrypt(nonce, plaintext, aad)
 
 
-def aead_decrypt(key: bytes, aad: bytes, ciphertext: bytes,
-                 nonce: bytes = AEAD_NONCE) -> bytes:
-    """Raises cryptography.exceptions.InvalidTag on failure."""
+def aead_decrypt(key: bytes, nonce: bytes, aad: bytes, ciphertext: bytes) -> bytes:
+    """ChaCha20-Poly1305 decrypt + verify. Raises InvalidTag on failure."""
     return ChaCha20Poly1305(key).decrypt(nonce, ciphertext, aad)
-
-
-def hmac_sha256(key: bytes, data: bytes) -> bytes:
-    return _hmac.new(key, data, hashlib.sha256).digest()
-
-
-def hmac_verify(key: bytes, data: bytes, tag: bytes) -> bool:
-    return _hmac.compare_digest(hmac_sha256(key, data), tag)
 
 
 def random_bytes(n: int) -> bytes:

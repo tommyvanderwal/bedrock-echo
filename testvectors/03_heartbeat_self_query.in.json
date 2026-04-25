@@ -1,0 +1,9 @@
+{
+  "description": "HEARTBEAT with query_target_id == own sender_id (Appendix A self-query), 1-block payload",
+  "msg_type": "0x01 HEARTBEAT",
+  "cluster_key": "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f",
+  "sender_id": 1,
+  "timestamp_ms": 1700000000002,
+  "query_target_id": 1,
+  "own_payload": "696e74656e743d70726f6d6f74652d5200000000000000000000000000000000"
+}

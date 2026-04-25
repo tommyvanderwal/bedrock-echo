@@ -1,13 +1,15 @@
-"""Bedrock Echo wire-format encode/decode.
+"""Bedrock Echo wire-format encode/decode (v1).
 
 See PROTOCOL.md for the authoritative spec. Constants and layouts match
 that document byte-for-byte. Every function is pure: no I/O, no time.
 
-Sizes and structure:
-  header    = 32 bytes (magic | msg_type | reserved | sender_id | sequence |
-                        timestamp_ms | payload_len)
-  payload   = payload_len bytes
-  trailer   = 32-byte HMAC (0x01/0x02/0x03/0x21) or nothing (0x10/0x20)
+Wire format summary:
+  header (14 B):   magic | msg_type | sender_id | timestamp_ms
+  payload:         encrypted (most types) or plaintext (DISCOVER, UNKNOWN_SOURCE)
+  trailer (16 B):  Poly1305 tag (AEAD types) or absent (unauthenticated types)
+
+Block-granular payload sizing: own_payload, peer_payload are 0..36 blocks
+of 32 bytes each, declared by an inline u8 count field where applicable.
 """
 from __future__ import annotations
 
@@ -16,434 +18,544 @@ import struct
 from dataclasses import dataclass, field
 from typing import ClassVar
 
+from cryptography.exceptions import InvalidTag
+
 from . import crypto
 
+
+# ── Wire constants (PROTOCOL.md §2, §3) ────────────────────────────────────
+
 MAGIC = b"Echo"
-HEADER_LEN = 32
-HMAC_LEN = 32
+HEADER_LEN = 14
+AEAD_TAG_LEN = 16
 MTU_CAP = 1400
 
-# message types
+# msg_type values
 MSG_HEARTBEAT       = 0x01
 MSG_STATUS_LIST     = 0x02
 MSG_STATUS_DETAIL   = 0x03
+MSG_DISCOVER        = 0x04
 MSG_UNKNOWN_SOURCE  = 0x10
 MSG_BOOTSTRAP       = 0x20
 MSG_BOOTSTRAP_ACK   = 0x21
 
 ALL_MSG_TYPES = {
-    MSG_HEARTBEAT, MSG_STATUS_LIST, MSG_STATUS_DETAIL,
+    MSG_HEARTBEAT, MSG_STATUS_LIST, MSG_STATUS_DETAIL, MSG_DISCOVER,
     MSG_UNKNOWN_SOURCE, MSG_BOOTSTRAP, MSG_BOOTSTRAP_ACK,
 }
 
-HMAC_MSG_TYPES = {
+AEAD_CLUSTER_KEY_TYPES = {
     MSG_HEARTBEAT, MSG_STATUS_LIST, MSG_STATUS_DETAIL, MSG_BOOTSTRAP_ACK,
 }
 
-NODE_PAYLOAD_MAX = 128
-LIST_ENTRY_LEN = 16
-LIST_MAX_ENTRIES = 64
+# sender_id reservations
+WITNESS_SENDER_ID = 0xFF
+NODE_SENDER_ID_MAX = 0xFE
+
+# block granularity for variable payloads
+PAYLOAD_BLOCK_SIZE = 32
+PAYLOAD_MAX_BLOCKS = 36
+PAYLOAD_MAX_BYTES = PAYLOAD_BLOCK_SIZE * PAYLOAD_MAX_BLOCKS  # 1152
+
+# STATUS_LIST entry constraints
+LIST_ENTRY_LEN = 5
+LIST_MAX_ENTRIES = 128
+
+# query_target_id sentinel meaning "give me LIST not DETAIL"
+QUERY_LIST_SENTINEL = 0xFF
+
+# crypto field sizes
 CLUSTER_KEY_LEN = 32
 EPH_PUBKEY_LEN = 32
-AEAD_TAG_LEN = 16
-BOOTSTRAP_INIT_PAYLOAD_MAX = 96
+WITNESS_PUBKEY_LEN = 32
+
+# total packet sizes
+DISCOVER_LEN = HEADER_LEN
+UNKNOWN_SOURCE_LEN = HEADER_LEN + WITNESS_PUBKEY_LEN
+BOOTSTRAP_LEN = HEADER_LEN + EPH_PUBKEY_LEN + CLUSTER_KEY_LEN + AEAD_TAG_LEN
+BOOTSTRAP_ACK_PLAINTEXT_LEN = 5  # status (1) + witness_uptime_seconds (4)
+BOOTSTRAP_ACK_LEN = HEADER_LEN + BOOTSTRAP_ACK_PLAINTEXT_LEN + AEAD_TAG_LEN
+
+# STATUS_DETAIL status_and_blocks byte
+STATUS_DETAIL_NOT_FOUND_BIT = 0x80
+STATUS_DETAIL_BLOCKS_MASK = 0x3F  # bits 0-5 (bit 6 reserved per spec)
 
 
 # ── Exceptions ─────────────────────────────────────────────────────────────
 
 
 class ProtocolError(Exception):
-    """Any structural / length / magic / reserved violation. Caller should
-    silently drop the packet that caused this (see PROTOCOL.md §12)."""
+    """Structural / length / magic violation. Caller silently drops."""
 
 
 class AuthError(Exception):
-    """HMAC or AEAD verification failed."""
+    """AEAD verification failed (bad key, tampered packet, etc.)."""
 
 
-# ── Header ──────────────────────────────────────────────────────────────────
+# ── Header ─────────────────────────────────────────────────────────────────
 
 
 @dataclass(frozen=True)
 class Header:
-    msg_type: int
-    reserved: int
-    sender_id: bytes        # 8 bytes
-    sequence: int
-    timestamp_ms: int
-    payload_len: int
+    """The 14-byte common header.
 
-    _STRUCT: ClassVar[struct.Struct] = struct.Struct(">4sBB8sQqH")
-    # fields: magic | msg_type | reserved | sender_id | sequence | timestamp_ms | payload_len
+    Layout:
+        offset  size  field
+        0       4     magic ("Echo")
+        4       1     msg_type
+        5       1     sender_id (0x00..0xFE for nodes, 0xFF for witness)
+        6       8     timestamp_ms (i64, big-endian)
+    """
+    msg_type: int
+    sender_id: int
+    timestamp_ms: int
+
+    _STRUCT: ClassVar[struct.Struct] = struct.Struct(">4sBBq")
 
     def pack(self) -> bytes:
         return self._STRUCT.pack(
             MAGIC,
             self.msg_type & 0xFF,
-            self.reserved & 0xFF,
-            self.sender_id,
-            self.sequence & 0xFFFFFFFFFFFFFFFF,
+            self.sender_id & 0xFF,
             self.timestamp_ms,
-            self.payload_len & 0xFFFF,
         )
 
     @classmethod
     def unpack(cls, buf: bytes) -> "Header":
         if len(buf) < HEADER_LEN:
             raise ProtocolError(f"short header: {len(buf)} < {HEADER_LEN}")
-        magic, mt, reserved, sid, seq, ts, pl = cls._STRUCT.unpack_from(buf, 0)
+        magic, mt, sid, ts = cls._STRUCT.unpack_from(buf, 0)
         if magic != MAGIC:
             raise ProtocolError(f"bad magic: {magic!r}")
-        if reserved != 0x00:
-            raise ProtocolError(f"nonzero reserved: {reserved:#x}")
         if mt not in ALL_MSG_TYPES:
             raise ProtocolError(f"unknown msg_type: {mt:#x}")
-        if len(sid) != 8:
-            raise ProtocolError("sender_id not 8 bytes")
-        return cls(
-            msg_type=mt, reserved=reserved, sender_id=bytes(sid),
-            sequence=seq, timestamp_ms=ts, payload_len=pl,
+        return cls(msg_type=mt, sender_id=sid, timestamp_ms=ts)
+
+
+# ── Nonce derivation (PROTOCOL.md §4.2) ────────────────────────────────────
+
+
+def derive_nonce(sender_id: int, timestamp_ms: int) -> bytes:
+    """Build the 12-byte ChaCha20-Poly1305 nonce from header fields.
+
+    nonce = sender_id (1 B) || 0x00 0x00 0x00 || timestamp_ms (8 B BE)
+    """
+    return struct.pack(">B3sq", sender_id & 0xFF, b"\x00\x00\x00", timestamp_ms)
+
+
+# ── Common header validation helpers ───────────────────────────────────────
+
+
+def _validate_node_sender_id(sender_id: int) -> None:
+    if not (0 <= sender_id <= NODE_SENDER_ID_MAX):
+        raise ProtocolError(
+            f"node sender_id must be 0x00..0xFE, got {sender_id:#x}"
         )
 
 
-# ── Encode / decode per message type ───────────────────────────────────────
+def _validate_witness_sender_id(sender_id: int) -> None:
+    if sender_id != WITNESS_SENDER_ID:
+        raise ProtocolError(
+            f"witness sender_id must be 0xFF, got {sender_id:#x}"
+        )
 
 
-def _validate_sender_id(sender_id: bytes, from_node: bool) -> None:
-    if len(sender_id) != 8:
-        raise ProtocolError("sender_id must be 8 bytes")
-    if from_node and sender_id == b"\x00" * 8:
-        raise ProtocolError("sender_id == 0 invalid from node")
+def _check_blocks(n_blocks: int) -> None:
+    if not (0 <= n_blocks <= PAYLOAD_MAX_BLOCKS):
+        raise ProtocolError(
+            f"block count must be 0..{PAYLOAD_MAX_BLOCKS}, got {n_blocks}"
+        )
 
 
-def _pack_hmac(packet_minus_trailer: bytes, cluster_key: bytes) -> bytes:
-    return packet_minus_trailer + crypto.hmac_sha256(cluster_key, packet_minus_trailer)
+def _check_payload_size(payload: bytes) -> None:
+    if len(payload) % PAYLOAD_BLOCK_SIZE != 0:
+        raise ProtocolError(
+            f"payload length {len(payload)} not a multiple of "
+            f"{PAYLOAD_BLOCK_SIZE} bytes (block-granular)"
+        )
+    if len(payload) > PAYLOAD_MAX_BYTES:
+        raise ProtocolError(
+            f"payload {len(payload)} bytes exceeds max {PAYLOAD_MAX_BYTES}"
+        )
 
 
-def _verify_and_strip_hmac(buf: bytes, cluster_key: bytes) -> bytes:
-    if len(buf) < HMAC_LEN:
-        raise ProtocolError("packet shorter than HMAC tag")
-    data, tag = buf[:-HMAC_LEN], buf[-HMAC_LEN:]
-    if not crypto.hmac_verify(cluster_key, data, tag):
-        raise AuthError("HMAC mismatch")
-    return data
+def _aead_seal(cluster_key: bytes, header: Header, plaintext: bytes) -> bytes:
+    """Encrypt plaintext under cluster_key with header as AAD; return
+    full packet (header || ciphertext+tag)."""
+    if len(cluster_key) != CLUSTER_KEY_LEN:
+        raise ProtocolError("cluster_key must be 32 bytes")
+    aad = header.pack()
+    nonce = derive_nonce(header.sender_id, header.timestamp_ms)
+    ct = crypto.aead_encrypt(cluster_key, nonce, aad, plaintext)
+    return aad + ct
 
 
-# ---- HEARTBEAT (0x01) ----
+def _aead_open(cluster_key: bytes, buf: bytes) -> tuple[Header, bytes]:
+    """Verify+decrypt a packet under cluster_key. Returns (header, plaintext).
+    Raises AuthError on tag mismatch, ProtocolError on structural issues."""
+    if len(buf) < HEADER_LEN + AEAD_TAG_LEN:
+        raise ProtocolError("packet shorter than header+tag")
+    if len(cluster_key) != CLUSTER_KEY_LEN:
+        raise ProtocolError("cluster_key must be 32 bytes")
+    header = Header.unpack(buf)
+    aad = buf[:HEADER_LEN]
+    ciphertext = buf[HEADER_LEN:]
+    nonce = derive_nonce(header.sender_id, header.timestamp_ms)
+    try:
+        plaintext = crypto.aead_decrypt(cluster_key, nonce, aad, ciphertext)
+    except InvalidTag as e:
+        raise AuthError("AEAD tag verification failed") from e
+    return header, plaintext
+
+
+# ── HEARTBEAT (0x01) — node → witness ──────────────────────────────────────
 
 
 @dataclass(frozen=True)
 class Heartbeat:
-    sender_id: bytes
-    sequence: int
+    sender_id: int
     timestamp_ms: int
-    query_target_id: bytes   # 8 bytes; 0 = list mode
-    own_payload: bytes       # 0..128 bytes
+    query_target_id: int    # 0x00..0xFE = DETAIL target; 0xFF = LIST request
+    own_payload: bytes      # length must be 0..1152 and multiple of 32
 
     def encode(self, cluster_key: bytes) -> bytes:
-        _validate_sender_id(self.sender_id, from_node=True)
-        if len(self.query_target_id) != 8:
-            raise ProtocolError("query_target_id must be 8 bytes")
-        if len(self.own_payload) > NODE_PAYLOAD_MAX:
-            raise ProtocolError(f"own_payload > {NODE_PAYLOAD_MAX}")
-        payload = self.query_target_id + self.own_payload
-        hdr = Header(MSG_HEARTBEAT, 0x00, self.sender_id, self.sequence,
-                     self.timestamp_ms, len(payload))
-        pkt = hdr.pack() + payload
-        return _pack_hmac(pkt, cluster_key)
+        _validate_node_sender_id(self.sender_id)
+        if not (0 <= self.query_target_id <= 0xFF):
+            raise ProtocolError("query_target_id must be 0..0xFF")
+        _check_payload_size(self.own_payload)
+        n_blocks = len(self.own_payload) // PAYLOAD_BLOCK_SIZE
+        plaintext = struct.pack(">BB", self.query_target_id, n_blocks) + self.own_payload
+        header = Header(MSG_HEARTBEAT, self.sender_id, self.timestamp_ms)
+        return _aead_seal(cluster_key, header, plaintext)
 
 
 def decode_heartbeat(buf: bytes, cluster_key: bytes) -> Heartbeat:
-    data = _verify_and_strip_hmac(buf, cluster_key)
-    hdr = Header.unpack(data)
-    if hdr.msg_type != MSG_HEARTBEAT:
+    header, pt = _aead_open(cluster_key, buf)
+    if header.msg_type != MSG_HEARTBEAT:
         raise ProtocolError("not a HEARTBEAT")
-    if len(data) != HEADER_LEN + hdr.payload_len:
-        raise ProtocolError("declared length mismatch")
-    if hdr.payload_len < 8 or hdr.payload_len > 8 + NODE_PAYLOAD_MAX:
-        raise ProtocolError("heartbeat payload_len out of range")
-    payload = data[HEADER_LEN:HEADER_LEN + hdr.payload_len]
+    if len(pt) < 2:
+        raise ProtocolError("heartbeat plaintext too short")
+    qt, n_blocks = pt[0], pt[1]
+    _check_blocks(n_blocks)
+    expected_pt = 2 + n_blocks * PAYLOAD_BLOCK_SIZE
+    if len(pt) != expected_pt:
+        raise ProtocolError(
+            f"heartbeat plaintext length {len(pt)} != expected {expected_pt}"
+        )
     return Heartbeat(
-        sender_id=hdr.sender_id,
-        sequence=hdr.sequence,
-        timestamp_ms=hdr.timestamp_ms,
-        query_target_id=payload[:8],
-        own_payload=payload[8:],
+        sender_id=header.sender_id,
+        timestamp_ms=header.timestamp_ms,
+        query_target_id=qt,
+        own_payload=bytes(pt[2:]),
     )
 
 
-# ---- STATUS_LIST (0x02) ----
+# ── STATUS_LIST (0x02) — witness → node ───────────────────────────────────
 
 
 @dataclass(frozen=True)
 class ListEntry:
-    peer_sender_id: bytes   # 8
-    peer_ipv4: bytes        # 4
-    last_seen_seconds: int
+    peer_sender_id: int
+    last_seen_ms: int        # u32 ms (0..49 days; 72h cap in practice)
 
     def pack(self) -> bytes:
-        if len(self.peer_sender_id) != 8 or len(self.peer_ipv4) != 4:
-            raise ProtocolError("list entry field sizes")
-        return struct.pack(">8s4sI", self.peer_sender_id, self.peer_ipv4,
-                           self.last_seen_seconds & 0xFFFFFFFF)
+        return struct.pack(">BI", self.peer_sender_id & 0xFF,
+                           self.last_seen_ms & 0xFFFFFFFF)
 
     @classmethod
     def unpack(cls, buf: bytes, off: int) -> "ListEntry":
         if len(buf) - off < LIST_ENTRY_LEN:
             raise ProtocolError("short list entry")
-        pid, ip, ls = struct.unpack_from(">8s4sI", buf, off)
-        return cls(peer_sender_id=bytes(pid), peer_ipv4=bytes(ip),
-                   last_seen_seconds=ls)
+        sid, ls = struct.unpack_from(">BI", buf, off)
+        return cls(peer_sender_id=sid, last_seen_ms=ls)
 
 
 @dataclass(frozen=True)
 class StatusList:
-    sender_id: bytes        # witness's id
-    sequence: int
-    timestamp_ms: int
-    witness_uptime_ms: int
+    timestamp_ms: int                 # witness's outgoing timestamp
+    witness_uptime_seconds: int       # u32 sec since witness boot
     entries: tuple[ListEntry, ...] = field(default=())
 
     def encode(self, cluster_key: bytes) -> bytes:
         if len(self.entries) > LIST_MAX_ENTRIES:
-            raise ProtocolError("too many list entries")
-        body = struct.pack(">QBB", self.witness_uptime_ms,
-                           len(self.entries), 0)
+            raise ProtocolError(
+                f"too many entries: {len(self.entries)} > {LIST_MAX_ENTRIES}"
+            )
+        plaintext = struct.pack(">IB", self.witness_uptime_seconds & 0xFFFFFFFF,
+                                len(self.entries))
         for e in self.entries:
-            body += e.pack()
-        hdr = Header(MSG_STATUS_LIST, 0x00, self.sender_id, self.sequence,
-                     self.timestamp_ms, len(body))
-        return _pack_hmac(hdr.pack() + body, cluster_key)
+            plaintext += e.pack()
+        header = Header(MSG_STATUS_LIST, WITNESS_SENDER_ID, self.timestamp_ms)
+        return _aead_seal(cluster_key, header, plaintext)
 
 
 def decode_status_list(buf: bytes, cluster_key: bytes) -> StatusList:
-    data = _verify_and_strip_hmac(buf, cluster_key)
-    hdr = Header.unpack(data)
-    if hdr.msg_type != MSG_STATUS_LIST:
+    header, pt = _aead_open(cluster_key, buf)
+    if header.msg_type != MSG_STATUS_LIST:
         raise ProtocolError("not a STATUS_LIST")
-    if len(data) != HEADER_LEN + hdr.payload_len:
-        raise ProtocolError("declared length mismatch")
-    body = data[HEADER_LEN:]
-    if len(body) < 10:
-        raise ProtocolError("status_list body too short")
-    up_ms, n, reserved = struct.unpack_from(">QBB", body, 0)
-    if reserved != 0:
-        raise ProtocolError("reserved byte nonzero")
+    _validate_witness_sender_id(header.sender_id)
+    if len(pt) < 5:
+        raise ProtocolError("status_list plaintext too short")
+    up_s, n = struct.unpack_from(">IB", pt, 0)
     if n > LIST_MAX_ENTRIES:
-        raise ProtocolError("num_entries too large")
-    expected = 10 + n * LIST_ENTRY_LEN
-    if len(body) != expected:
-        raise ProtocolError(f"status_list body length {len(body)} != {expected}")
+        raise ProtocolError(f"num_entries {n} > {LIST_MAX_ENTRIES}")
+    expected_pt = 5 + n * LIST_ENTRY_LEN
+    if len(pt) != expected_pt:
+        raise ProtocolError(
+            f"status_list plaintext length {len(pt)} != expected {expected_pt}"
+        )
     entries = tuple(
-        ListEntry.unpack(body, 10 + i * LIST_ENTRY_LEN) for i in range(n)
+        ListEntry.unpack(pt, 5 + i * LIST_ENTRY_LEN) for i in range(n)
     )
     return StatusList(
-        sender_id=hdr.sender_id, sequence=hdr.sequence,
-        timestamp_ms=hdr.timestamp_ms,
-        witness_uptime_ms=up_ms, entries=entries,
+        timestamp_ms=header.timestamp_ms,
+        witness_uptime_seconds=up_s,
+        entries=entries,
     )
 
 
-# ---- STATUS_DETAIL (0x03) ----
+# ── STATUS_DETAIL (0x03) — witness → node ─────────────────────────────────
 
 
 @dataclass(frozen=True)
 class StatusDetail:
-    sender_id: bytes
-    sequence: int
-    timestamp_ms: int
-    witness_uptime_ms: int
-    target_sender_id: bytes
-    status: int                 # 0x00 found, 0x01 not found
+    timestamp_ms: int                 # witness's outgoing timestamp
+    witness_uptime_seconds: int
+    target_sender_id: int             # echo of caller's query_target_id
+    found: bool
     peer_ipv4: bytes = b"\x00" * 4
-    last_seen_seconds: int = 0
-    peer_payload: bytes = b""
+    peer_seen_ms_ago: int = 0
+    peer_payload: bytes = b""         # length must be 0..1152 and multiple of 32
 
     def encode(self, cluster_key: bytes) -> bytes:
-        if len(self.target_sender_id) != 8:
-            raise ProtocolError("target_sender_id must be 8 bytes")
-        if self.status not in (0x00, 0x01):
-            raise ProtocolError("bad status byte")
-        body = struct.pack(">Q8sBB", self.witness_uptime_ms,
-                           self.target_sender_id, self.status, 0)
-        if self.status == 0x00:
+        if not (0 <= self.target_sender_id <= 0xFF):
+            raise ProtocolError("target_sender_id must be 0..0xFF")
+        if self.found:
+            _check_payload_size(self.peer_payload)
             if len(self.peer_ipv4) != 4:
                 raise ProtocolError("peer_ipv4 must be 4 bytes")
-            if len(self.peer_payload) > NODE_PAYLOAD_MAX:
-                raise ProtocolError("peer_payload too long")
-            body += struct.pack(">4sIB", self.peer_ipv4,
-                                self.last_seen_seconds & 0xFFFFFFFF,
-                                len(self.peer_payload))
-            body += self.peer_payload
-        hdr = Header(MSG_STATUS_DETAIL, 0x00, self.sender_id, self.sequence,
-                     self.timestamp_ms, len(body))
-        return _pack_hmac(hdr.pack() + body, cluster_key)
+            n_blocks = len(self.peer_payload) // PAYLOAD_BLOCK_SIZE
+            # status_and_blocks: bit 7 = 0 (found), bit 6 = 0 (reserved),
+            # bits 0-5 = block count
+            status_byte = n_blocks  # 0..36
+            plaintext = (
+                struct.pack(">IBB",
+                            self.witness_uptime_seconds & 0xFFFFFFFF,
+                            self.target_sender_id & 0xFF,
+                            status_byte)
+                + self.peer_ipv4
+                + struct.pack(">I", self.peer_seen_ms_ago & 0xFFFFFFFF)
+                + self.peer_payload
+            )
+        else:
+            # not found: bit 7 = 1, other bits 0 in v1
+            status_byte = 0x80
+            plaintext = struct.pack(">IBB",
+                                    self.witness_uptime_seconds & 0xFFFFFFFF,
+                                    self.target_sender_id & 0xFF,
+                                    status_byte)
+        header = Header(MSG_STATUS_DETAIL, WITNESS_SENDER_ID, self.timestamp_ms)
+        return _aead_seal(cluster_key, header, plaintext)
 
 
 def decode_status_detail(buf: bytes, cluster_key: bytes) -> StatusDetail:
-    data = _verify_and_strip_hmac(buf, cluster_key)
-    hdr = Header.unpack(data)
-    if hdr.msg_type != MSG_STATUS_DETAIL:
+    header, pt = _aead_open(cluster_key, buf)
+    if header.msg_type != MSG_STATUS_DETAIL:
         raise ProtocolError("not a STATUS_DETAIL")
-    if len(data) != HEADER_LEN + hdr.payload_len:
-        raise ProtocolError("declared length mismatch")
-    body = data[HEADER_LEN:]
-    if len(body) < 18:
-        raise ProtocolError("status_detail body too short")
-    up_ms, target, status, reserved = struct.unpack_from(">Q8sBB", body, 0)
-    if reserved != 0:
-        raise ProtocolError("reserved byte nonzero")
-    if status == 0x01:
-        if len(body) != 18:
-            raise ProtocolError("not_found body length must be 18")
+    _validate_witness_sender_id(header.sender_id)
+    if len(pt) < 6:
+        raise ProtocolError("status_detail plaintext too short")
+    up_s, target, sb = struct.unpack_from(">IBB", pt, 0)
+    if sb & STATUS_DETAIL_NOT_FOUND_BIT:
+        # not found — bits 0-6 are reserved (v1 ignores them)
+        if len(pt) != 6:
+            raise ProtocolError("not_found plaintext must be exactly 6 bytes")
         return StatusDetail(
-            sender_id=hdr.sender_id, sequence=hdr.sequence,
-            timestamp_ms=hdr.timestamp_ms, witness_uptime_ms=up_ms,
-            target_sender_id=bytes(target), status=status,
+            timestamp_ms=header.timestamp_ms,
+            witness_uptime_seconds=up_s,
+            target_sender_id=target,
+            found=False,
         )
-    if status != 0x00:
-        raise ProtocolError("bad status byte")
-    if len(body) < 27:
-        raise ProtocolError("found body too short")
-    ipv4, ls, pl_len = struct.unpack_from(">4sIB", body, 18)
-    expected = 27 + pl_len
-    if len(body) != expected:
-        raise ProtocolError(f"found body length {len(body)} != {expected}")
+    # found — bit 6 is reserved (ignore for forward-compat); bits 0-5 = block count
+    n_blocks = sb & STATUS_DETAIL_BLOCKS_MASK
+    if n_blocks > PAYLOAD_MAX_BLOCKS:
+        raise ProtocolError(f"detail block count {n_blocks} invalid")
+    expected_pt = 6 + 4 + 4 + n_blocks * PAYLOAD_BLOCK_SIZE  # +ipv4 +seen_ms +payload
+    if len(pt) != expected_pt:
+        raise ProtocolError(
+            f"status_detail plaintext length {len(pt)} != expected {expected_pt}"
+        )
+    peer_ipv4 = bytes(pt[6:10])
+    (seen_ms,) = struct.unpack_from(">I", pt, 10)
+    peer_payload = bytes(pt[14:14 + n_blocks * PAYLOAD_BLOCK_SIZE])
     return StatusDetail(
-        sender_id=hdr.sender_id, sequence=hdr.sequence,
-        timestamp_ms=hdr.timestamp_ms, witness_uptime_ms=up_ms,
-        target_sender_id=bytes(target), status=status,
-        peer_ipv4=bytes(ipv4), last_seen_seconds=ls,
-        peer_payload=bytes(body[27:27 + pl_len]),
+        timestamp_ms=header.timestamp_ms,
+        witness_uptime_seconds=up_s,
+        target_sender_id=target,
+        found=True,
+        peer_ipv4=peer_ipv4,
+        peer_seen_ms_ago=seen_ms,
+        peer_payload=peer_payload,
     )
 
 
-# ---- UNKNOWN_SOURCE (0x10) ----
+# ── DISCOVER (0x04) — node → witness, unauthenticated ─────────────────────
+
+
+@dataclass(frozen=True)
+class Discover:
+    sender_id: int       # node's chosen ID; can be any 0x00..0xFE
+    timestamp_ms: int    # caller's wall-clock; useful for RTT measurement
+
+    def encode(self) -> bytes:
+        _validate_node_sender_id(self.sender_id)
+        return Header(MSG_DISCOVER, self.sender_id, self.timestamp_ms).pack()
+
+
+def decode_discover(buf: bytes) -> Discover:
+    if len(buf) != DISCOVER_LEN:
+        raise ProtocolError(
+            f"DISCOVER must be exactly {DISCOVER_LEN} bytes, got {len(buf)}"
+        )
+    header = Header.unpack(buf)
+    if header.msg_type != MSG_DISCOVER:
+        raise ProtocolError("not a DISCOVER")
+    _validate_node_sender_id(header.sender_id)
+    return Discover(sender_id=header.sender_id, timestamp_ms=header.timestamp_ms)
+
+
+# ── UNKNOWN_SOURCE (0x10) — witness → node, unauthenticated ───────────────
 
 
 @dataclass(frozen=True)
 class UnknownSource:
-    sender_id: bytes
-    sequence: int
-    timestamp_ms: int
+    timestamp_ms: int           # witness's best-effort wall-clock; MAY be 0
+    witness_pubkey: bytes       # X25519 public key, 32 bytes
 
     def encode(self) -> bytes:
-        hdr = Header(MSG_UNKNOWN_SOURCE, 0x00, self.sender_id, self.sequence,
-                     self.timestamp_ms, 0)
-        return hdr.pack()
+        if len(self.witness_pubkey) != WITNESS_PUBKEY_LEN:
+            raise ProtocolError("witness_pubkey must be 32 bytes")
+        header = Header(MSG_UNKNOWN_SOURCE, WITNESS_SENDER_ID, self.timestamp_ms)
+        return header.pack() + self.witness_pubkey
 
 
 def decode_unknown_source(buf: bytes) -> UnknownSource:
-    hdr = Header.unpack(buf)
-    if hdr.msg_type != MSG_UNKNOWN_SOURCE:
+    if len(buf) != UNKNOWN_SOURCE_LEN:
+        raise ProtocolError(
+            f"UNKNOWN_SOURCE must be exactly {UNKNOWN_SOURCE_LEN} bytes, "
+            f"got {len(buf)}"
+        )
+    header = Header.unpack(buf)
+    if header.msg_type != MSG_UNKNOWN_SOURCE:
         raise ProtocolError("not UNKNOWN_SOURCE")
-    if hdr.payload_len != 0 or len(buf) != HEADER_LEN:
-        raise ProtocolError("UNKNOWN_SOURCE must have no payload")
-    return UnknownSource(sender_id=hdr.sender_id, sequence=hdr.sequence,
-                         timestamp_ms=hdr.timestamp_ms)
+    _validate_witness_sender_id(header.sender_id)
+    return UnknownSource(
+        timestamp_ms=header.timestamp_ms,
+        witness_pubkey=bytes(buf[HEADER_LEN:]),
+    )
 
 
-# ---- BOOTSTRAP (0x20) ----
+# ── BOOTSTRAP (0x20) — node → witness, AEAD via ECDH ──────────────────────
 
 
 @dataclass(frozen=True)
 class Bootstrap:
-    sender_id: bytes
-    sequence: int
+    sender_id: int
     timestamp_ms: int
-    cluster_key: bytes            # the secret being delivered (32 B)
-    init_payload: bytes = b""     # 0..96 bytes
+    cluster_key: bytes          # the secret being delivered (32 B)
 
-    def encode(self, witness_x25519_pub: bytes, eph_priv: bytes) -> bytes:
-        _validate_sender_id(self.sender_id, from_node=True)
+    def encode(self, witness_pubkey: bytes, eph_priv: bytes) -> bytes:
+        _validate_node_sender_id(self.sender_id)
         if len(self.cluster_key) != CLUSTER_KEY_LEN:
             raise ProtocolError("cluster_key must be 32 bytes")
-        if len(self.init_payload) > BOOTSTRAP_INIT_PAYLOAD_MAX:
-            raise ProtocolError("init_payload > 96 bytes")
-        if len(eph_priv) != 32 or len(witness_x25519_pub) != 32:
+        if len(eph_priv) != 32 or len(witness_pubkey) != 32:
             raise ProtocolError("bad key lengths")
-        plaintext = self.cluster_key + self.init_payload
         eph_pub = crypto.x25519_pub_from_priv(eph_priv)
-        shared = crypto.x25519_shared(eph_priv, witness_x25519_pub)
-        derived = crypto.hkdf_sha256(shared)
-        payload_len = EPH_PUBKEY_LEN + len(plaintext) + AEAD_TAG_LEN
-        hdr = Header(MSG_BOOTSTRAP, 0x00, self.sender_id, self.sequence,
-                     self.timestamp_ms, payload_len)
-        hdr_bytes = hdr.pack()
-        ciphertext = crypto.aead_encrypt(derived, hdr_bytes, plaintext)
-        return hdr_bytes + eph_pub + ciphertext
+        shared = crypto.x25519_shared(eph_priv, witness_pubkey)
+        aead_key = crypto.hkdf_sha256(shared)
+        header = Header(MSG_BOOTSTRAP, self.sender_id, self.timestamp_ms)
+        aad = header.pack()
+        ct = crypto.aead_encrypt(aead_key, crypto.BOOTSTRAP_AEAD_NONCE, aad,
+                                 self.cluster_key)
+        return aad + eph_pub + ct
 
 
-def decode_bootstrap(buf: bytes, witness_x25519_priv: bytes) -> Bootstrap:
-    hdr = Header.unpack(buf)
-    if hdr.msg_type != MSG_BOOTSTRAP:
+def decode_bootstrap(buf: bytes, witness_priv: bytes) -> Bootstrap:
+    if len(buf) != BOOTSTRAP_LEN:
+        raise ProtocolError(
+            f"BOOTSTRAP must be exactly {BOOTSTRAP_LEN} bytes, got {len(buf)}"
+        )
+    header = Header.unpack(buf)
+    if header.msg_type != MSG_BOOTSTRAP:
         raise ProtocolError("not a BOOTSTRAP")
-    if len(buf) != HEADER_LEN + hdr.payload_len:
-        raise ProtocolError("declared length mismatch")
-    if hdr.payload_len < EPH_PUBKEY_LEN + CLUSTER_KEY_LEN + AEAD_TAG_LEN:
-        raise ProtocolError("bootstrap payload too short")
-    pl = buf[HEADER_LEN:HEADER_LEN + hdr.payload_len]
-    eph_pub = pl[:EPH_PUBKEY_LEN]
-    ciphertext = pl[EPH_PUBKEY_LEN:]
-    shared = crypto.x25519_shared(witness_x25519_priv, eph_pub)
-    derived = crypto.hkdf_sha256(shared)
-    hdr_bytes = buf[:HEADER_LEN]
+    _validate_node_sender_id(header.sender_id)
+    eph_pub = bytes(buf[HEADER_LEN:HEADER_LEN + EPH_PUBKEY_LEN])
+    ciphertext = bytes(buf[HEADER_LEN + EPH_PUBKEY_LEN:])
     try:
-        plaintext = crypto.aead_decrypt(derived, hdr_bytes, ciphertext)
-    except Exception as e:  # cryptography.exceptions.InvalidTag
-        raise AuthError(f"AEAD verification failed: {e}")
-    if len(plaintext) < CLUSTER_KEY_LEN:
-        raise ProtocolError("decrypted plaintext too short")
-    if len(plaintext) > CLUSTER_KEY_LEN + BOOTSTRAP_INIT_PAYLOAD_MAX:
-        raise ProtocolError("decrypted plaintext too long")
+        shared = crypto.x25519_shared(witness_priv, eph_pub)
+    except Exception as e:
+        # Some libraries raise on small-subgroup elements; treat as auth failure.
+        raise AuthError(f"bad ephemeral pubkey: {e}") from e
+    aead_key = crypto.hkdf_sha256(shared)
+    try:
+        plaintext = crypto.aead_decrypt(aead_key, crypto.BOOTSTRAP_AEAD_NONCE,
+                                        buf[:HEADER_LEN], ciphertext)
+    except InvalidTag as e:
+        raise AuthError("BOOTSTRAP AEAD tag verification failed") from e
+    if len(plaintext) != CLUSTER_KEY_LEN:
+        raise ProtocolError(
+            f"BOOTSTRAP plaintext must be {CLUSTER_KEY_LEN} bytes, "
+            f"got {len(plaintext)}"
+        )
     return Bootstrap(
-        sender_id=hdr.sender_id, sequence=hdr.sequence,
-        timestamp_ms=hdr.timestamp_ms,
-        cluster_key=plaintext[:CLUSTER_KEY_LEN],
-        init_payload=plaintext[CLUSTER_KEY_LEN:],
+        sender_id=header.sender_id,
+        timestamp_ms=header.timestamp_ms,
+        cluster_key=plaintext,
     )
 
 
-# ---- BOOTSTRAP_ACK (0x21) ----
+# ── BOOTSTRAP_ACK (0x21) — witness → node ─────────────────────────────────
 
 
 @dataclass(frozen=True)
 class BootstrapAck:
-    sender_id: bytes       # witness sender_id
-    sequence: int
     timestamp_ms: int
-    status: int            # 0x00 new, 0x01 re-bootstrap same key
-    witness_uptime_ms: int
+    status: int                 # bit 0: 0=new, 1=idempotent re-bootstrap
+    witness_uptime_seconds: int
 
     def encode(self, cluster_key: bytes) -> bytes:
-        if self.status not in (0x00, 0x01):
-            raise ProtocolError("bad status byte")
-        body = struct.pack(">BQ", self.status, self.witness_uptime_ms)
-        hdr = Header(MSG_BOOTSTRAP_ACK, 0x00, self.sender_id, self.sequence,
-                     self.timestamp_ms, len(body))
-        return _pack_hmac(hdr.pack() + body, cluster_key)
+        if not (0 <= self.status <= 0xFF):
+            raise ProtocolError("status byte out of range")
+        plaintext = struct.pack(">BI",
+                                self.status & 0xFF,
+                                self.witness_uptime_seconds & 0xFFFFFFFF)
+        header = Header(MSG_BOOTSTRAP_ACK, WITNESS_SENDER_ID, self.timestamp_ms)
+        return _aead_seal(cluster_key, header, plaintext)
 
 
 def decode_bootstrap_ack(buf: bytes, cluster_key: bytes) -> BootstrapAck:
-    data = _verify_and_strip_hmac(buf, cluster_key)
-    hdr = Header.unpack(data)
-    if hdr.msg_type != MSG_BOOTSTRAP_ACK:
-        raise ProtocolError("not a BOOTSTRAP_ACK")
-    if len(data) != HEADER_LEN + hdr.payload_len:
-        raise ProtocolError("declared length mismatch")
-    if hdr.payload_len != 9:
-        raise ProtocolError("BOOTSTRAP_ACK payload_len must be 9")
-    status, up_ms = struct.unpack_from(">BQ", data, HEADER_LEN)
-    if status not in (0x00, 0x01):
-        raise ProtocolError("bad status byte")
+    if len(buf) != BOOTSTRAP_ACK_LEN:
+        raise ProtocolError(
+            f"BOOTSTRAP_ACK must be exactly {BOOTSTRAP_ACK_LEN} bytes, "
+            f"got {len(buf)}"
+        )
+    header, pt = _aead_open(cluster_key, buf)
+    if header.msg_type != MSG_BOOTSTRAP_ACK:
+        raise ProtocolError("not BOOTSTRAP_ACK")
+    _validate_witness_sender_id(header.sender_id)
+    if len(pt) != BOOTSTRAP_ACK_PLAINTEXT_LEN:
+        raise ProtocolError(
+            f"BOOTSTRAP_ACK plaintext must be {BOOTSTRAP_ACK_PLAINTEXT_LEN} bytes"
+        )
+    status, up_s = struct.unpack(">BI", pt)
     return BootstrapAck(
-        sender_id=hdr.sender_id, sequence=hdr.sequence,
-        timestamp_ms=hdr.timestamp_ms, status=status,
-        witness_uptime_ms=up_ms,
+        timestamp_ms=header.timestamp_ms,
+        status=status,
+        witness_uptime_seconds=up_s,
     )
 
 
-# ── Utility ────────────────────────────────────────────────────────────────
+# ── Convenience helpers ────────────────────────────────────────────────────
 
 
 def ipv4_to_bytes(s: str) -> bytes:
@@ -452,3 +564,13 @@ def ipv4_to_bytes(s: str) -> bytes:
 
 def ipv4_from_bytes(b: bytes) -> str:
     return str(ipaddress.IPv4Address(b))
+
+
+def status_is_new(status: int) -> bool:
+    """BOOTSTRAP_ACK status: bit 0 = 0 means new entry created."""
+    return (status & 0x01) == 0
+
+
+def status_is_idempotent(status: int) -> bool:
+    """BOOTSTRAP_ACK status: bit 0 = 1 means existing entry, idempotent."""
+    return (status & 0x01) == 1

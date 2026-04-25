@@ -1,0 +1,8 @@
+{
+  "description": "STATUS_LIST reply with 0 entries (newly bootstrapped witness)",
+  "msg_type": "0x02 STATUS_LIST",
+  "cluster_key": "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f",
+  "timestamp_ms": 1700000000051,
+  "witness_uptime_seconds": 10,
+  "entries": []
+}

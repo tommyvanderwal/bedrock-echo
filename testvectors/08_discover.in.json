@@ -1,0 +1,6 @@
+{
+  "description": "DISCOVER probe from a node attempting witness identification",
+  "msg_type": "0x04 DISCOVER",
+  "sender_id": 1,
+  "timestamp_ms": 1699999999500
+}

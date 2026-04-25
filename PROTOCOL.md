@@ -90,7 +90,7 @@ Every implementation MUST silently drop any packet where:
 |--------|-------------------|------------------|----------|-----------------------|
 | `0x01` | HEARTBEAT         | node → witness   | AEAD     | 32 + 32N B            |
 | `0x02` | STATUS_LIST       | witness → node   | AEAD     | 35 + 5N B             |
-| `0x03` | STATUS_DETAIL     | witness → node   | AEAD     | 52 (not found) / 60 + 32N B (found) |
+| `0x03` | STATUS_DETAIL     | witness → node   | AEAD     | 36 (not found) / 44 + 32N B (found) |
 | `0x04` | DISCOVER          | node → witness   | none     | 14 B                  |
 | `0x10` | UNKNOWN_SOURCE    | witness → node   | none     | 46 B                  |
 | `0x20` | BOOTSTRAP         | node → witness   | AEAD-DH  | 94 B                  |
@@ -385,13 +385,15 @@ Total plaintext (not found): 6 bytes
 On the wire:
 
 ```
-Total UDP size (found):     14 + (14 + 32N) + 16 = 44 + 32N + 16 = 60 + 32N B
-Total UDP size (not found): 14 + 6 + 16 = 36 + 16 = 52 B
+Total UDP size (found):     14 (header) + (14 + 32N) (ciphertext) + 16 (tag)
+                          = 44 + 32N B
+Total UDP size (not found): 14 (header) + 6 (ciphertext) + 16 (tag)
+                          = 36 B
 
-Found N=0   →   60 B  (peer exists but never advertised state)
-Found N=4   →  188 B  (typical Raft 128 B state)
-Found N=36  → 1212 B  (max, 188 B MTU slack)
-Not found   →   52 B
+Found N=0   →   44 B  (peer exists but never advertised state)
+Found N=4   →  172 B  (typical Raft 128 B state)
+Found N=36  → 1196 B  (max, 204 B MTU slack)
+Not found   →   36 B
 ```
 
 ### 5.4 DISCOVER (`0x04`) — node → witness

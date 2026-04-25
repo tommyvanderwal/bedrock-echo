@@ -1,20 +1,30 @@
-# Bedrock Echo v0.001 canonical test vectors
-# Each pair of files below must be parsed identically by every impl.
-01_heartbeat_list_query.in.json
-01_heartbeat_list_query.out.bin
-02_heartbeat_detail_query.in.json
-02_heartbeat_detail_query.out.bin
-03_status_list_two_nodes.in.json
-03_status_list_two_nodes.out.bin
-04_status_detail_found.in.json
-04_status_detail_found.out.bin
-05_status_detail_not_found.in.json
-05_status_detail_not_found.out.bin
-06_unknown_source.in.json
-06_unknown_source.out.bin
-07_bootstrap.in.json
-07_bootstrap.out.bin
-08_bootstrap_ack_new.in.json
-08_bootstrap_ack_new.out.bin
-09_bootstrap_ack_rebootstrap.in.json
-09_bootstrap_ack_rebootstrap.out.bin
+Bedrock Echo v1 test vectors
+============================
+
+These vectors are the canonical cross-language contract for the protocol.
+Every conformant implementation MUST:
+  1. Encode the inputs in each .in.json byte-exactly to the corresponding .out.bin
+  2. Decode each .out.bin and round-trip back to inputs
+
+Vectors:
+  01  HEARTBEAT list-query, empty payload                        (cluster_key)
+  02  HEARTBEAT detail-query for peer B, 4-block payload          (cluster_key)
+  03  HEARTBEAT self-query (Appendix A), 1-block payload          (cluster_key)
+  04  STATUS_LIST with 2 entries                                  (cluster_key)
+  05  STATUS_LIST empty                                           (cluster_key)
+  06  STATUS_DETAIL found, 4-block peer_payload                   (cluster_key)
+  07  STATUS_DETAIL not found                                     (cluster_key)
+  08  DISCOVER                                                    (no auth)
+  09  UNKNOWN_SOURCE with witness_pubkey                          (no auth)
+  10  BOOTSTRAP (fixed eph_priv)                                  (X25519 + AEAD)
+  11  BOOTSTRAP_ACK status=0x00 (new)                             (cluster_key)
+  12  BOOTSTRAP_ACK status=0x01 (idempotent)                      (cluster_key)
+
+Reproducibility constants (in .in.json files):
+  cluster_key   = 0x10..0x2F (32 bytes)
+  witness_priv  = 0xAA × 32  (used to derive witness_pubkey)
+  eph_priv      = 0xBB × 32  (used in BOOTSTRAP)
+  node A id     = 0x01
+  node B id     = 0x02
+  node C id     = 0x03
+  witness id    = 0xFF

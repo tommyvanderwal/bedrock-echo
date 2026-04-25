@@ -1,10 +1,11 @@
-"""Loopback end-to-end test: real UDP socket, real Witness, real NodeClient,
-on localhost. Exercises bootstrap → heartbeat → status_list → status_detail
-→ witness reboot → auto-rebootstrap → recovery.
+"""End-to-end tests: NodeClient ↔ Witness over real UDP loopback.
+
+Spins up the witness in a thread on a random local port, exercises the
+full HEARTBEAT-first / fallback-to-BOOTSTRAP / DISCOVER flows, then shuts
+down cleanly.
 """
 from __future__ import annotations
 
-import os
 import socket
 import sys
 import threading
@@ -15,196 +16,133 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from echo import proto, crypto  # noqa: E402
-from echo.witness import Witness, MTU_CAP  # noqa: E402
-from echo.node import NodeClient  # noqa: E402
+from echo import proto, crypto, witness, node  # noqa: E402
 
 
-def _pick_port() -> int:
+CK = bytes(range(0x10, 0x30))
+
+
+def _bind_witness_socket() -> tuple[socket.socket, int]:
+    """Bind a UDP socket on 127.0.0.1 with a kernel-assigned port."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.bind(("127.0.0.1", 0))
-    _, port = s.getsockname()
-    s.close()
-    return port
+    return s, s.getsockname()[1]
 
 
-class WitnessLoop:
-    """Run a Witness on a background thread for the duration of a test."""
-
-    def __init__(self, witness: Witness, port: int):
-        self.witness = witness
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.bind(("127.0.0.1", port))
-        self.sock.settimeout(0.1)
-        self.running = True
-        self.t = threading.Thread(target=self._loop, daemon=True)
-
-    def start(self):
-        self.t.start()
-        return self
-
-    def _loop(self):
-        while self.running:
-            try:
-                data, src = self.sock.recvfrom(MTU_CAP + 64)
-            except socket.timeout:
-                continue
-            except OSError:
-                return
-            for reply, dst in self.witness.handle_packet(data, src):
-                try:
-                    self.sock.sendto(reply, dst)
-                except OSError:
-                    pass
-
-    def stop(self):
-        self.running = False
-        self.t.join(timeout=1)
-        self.sock.close()
+def _run_witness(w: witness.Witness, sock: socket.socket, stop: threading.Event):
+    sock.settimeout(0.1)
+    while not stop.is_set():
+        try:
+            data, src = sock.recvfrom(proto.MTU_CAP + 64)
+        except (socket.timeout, BlockingIOError):
+            continue
+        for reply, dst in w.handle_packet(data, src):
+            sock.sendto(reply, dst)
 
 
 @pytest.fixture
-def cluster_key():
-    return crypto.random_bytes(32)
-
-
-@pytest.fixture
-def witness_key():
-    return crypto.x25519_generate()
-
-
-def test_bootstrap_then_heartbeat_list(cluster_key, witness_key):
-    priv, pub = witness_key
-    port = _pick_port()
-    w = Witness(priv)
-    loop = WitnessLoop(w, port).start()
+def live_witness():
+    """Start a witness in a background thread; yield (witness, addr, pubkey)."""
+    sock, port = _bind_witness_socket()
+    priv = bytes([0xAA] * 32)
+    w = witness.Witness(priv)
+    stop = threading.Event()
+    t = threading.Thread(target=_run_witness, args=(w, sock, stop), daemon=True)
+    t.start()
     try:
-        node = NodeClient(
-            sender_id=b"A" * 8,
-            cluster_key=cluster_key,
-            witness_addr=("127.0.0.1", port),
-            witness_x25519_pub=pub,
-        )
-        ack = node.bootstrap(init_payload=b"primary")
-        assert ack.status == 0x00
-        sl = node.heartbeat_list(own_payload=b"primary-hb")
-        assert len(sl.entries) == 1
-        assert sl.entries[0].peer_sender_id == b"A" * 8
+        yield w, ("127.0.0.1", port), w.pub
     finally:
-        loop.stop()
-
-
-def test_two_nodes_see_each_other(cluster_key, witness_key):
-    priv, pub = witness_key
-    port = _pick_port()
-    w = Witness(priv)
-    loop = WitnessLoop(w, port).start()
-    try:
-        a = NodeClient(b"A" * 8, cluster_key, ("127.0.0.1", port), pub)
-        b = NodeClient(b"B" * 8, cluster_key, ("127.0.0.1", port), pub)
-        a.bootstrap(b"A-init")
-        b.bootstrap(b"B-init")
-        a.heartbeat_list(b"A-hb-1")  # seeds witness
-        b.heartbeat_list(b"B-hb-1")
-
-        detail = a.heartbeat_detail(b"B" * 8, own_payload=b"A-hb-2")
-        assert detail.status == 0x00
-        assert detail.target_sender_id == b"B" * 8
-        assert detail.peer_payload == b"B-hb-1"
-
-        detail_b = b.heartbeat_detail(b"A" * 8, own_payload=b"B-hb-2")
-        assert detail_b.status == 0x00
-        assert detail_b.peer_payload == b"A-hb-2"
-    finally:
-        loop.stop()
-
-
-def test_unknown_source_triggers_rebootstrap(cluster_key, witness_key):
-    priv, pub = witness_key
-    port = _pick_port()
-    w = Witness(priv)
-    loop = WitnessLoop(w, port).start()
-    try:
-        node = NodeClient(b"A" * 8, cluster_key, ("127.0.0.1", port), pub)
-        node.bootstrap()
-        node.heartbeat_list()
-
-        # Simulate a witness reboot: swap in a fresh Witness (same priv) so
-        # node's cluster is unknown. Kept keyfile consistent to mimic real
-        # reboot semantics.
-        loop.stop()
-        w2 = Witness(priv)
-        loop = WitnessLoop(w2, port).start()
-
-        # Heartbeat should trigger UNKNOWN_SOURCE → auto-rebootstrap → retry.
-        sl = node.heartbeat_list(own_payload=b"hello-again")
-        assert len(sl.entries) == 1
-    finally:
-        loop.stop()
-
-
-def test_wrong_cluster_key_is_silently_dropped(cluster_key, witness_key):
-    priv, pub = witness_key
-    port = _pick_port()
-    w = Witness(priv)
-    loop = WitnessLoop(w, port).start()
-    try:
-        good = NodeClient(b"A" * 8, cluster_key, ("127.0.0.1", port), pub)
-        good.bootstrap()
-        good.heartbeat_list()
-
-        # Attacker: same sender_id, different cluster_key. Witness should
-        # not accept its HEARTBEAT (HMAC will not verify under the known
-        # cluster's key).
-        attacker_key = crypto.random_bytes(32)
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(1.0)
-        hb = proto.Heartbeat(
-            sender_id=b"A" * 8, sequence=1, timestamp_ms=0,
-            query_target_id=b"\x00" * 8, own_payload=b"pwn",
-        )
-        sock.sendto(hb.encode(attacker_key), ("127.0.0.1", port))
-        try:
-            data, _ = sock.recvfrom(MTU_CAP + 64)
-        except socket.timeout:
-            data = b""
-        # The witness may send UNKNOWN_SOURCE (rate-limited) — anything else
-        # would be a bug.
-        if data:
-            assert data[4] == proto.MSG_UNKNOWN_SOURCE
+        stop.set()
+        t.join(timeout=1.0)
         sock.close()
 
-        # Meanwhile the honest node's state is unchanged.
-        sl = good.heartbeat_list()
-        assert len(sl.entries) == 1
-    finally:
-        loop.stop()
+
+def test_e2e_discover_returns_pubkey(live_witness):
+    w, addr, pub = live_witness
+    n = node.NodeClient(sender_id=0x01, cluster_key=CK,
+                        witness_addr=addr, witness_pubkey=pub)
+    us = n.discover()
+    assert us.witness_pubkey == pub
 
 
-def test_sequence_replay_dropped(cluster_key, witness_key):
-    priv, pub = witness_key
-    port = _pick_port()
-    w = Witness(priv)
-    loop = WitnessLoop(w, port).start()
-    try:
-        node = NodeClient(b"A" * 8, cluster_key, ("127.0.0.1", port), pub)
-        node.bootstrap()
-        sl = node.heartbeat_list()  # seq = some big number
-        # Re-encode a HEARTBEAT with a tiny sequence: witness should drop.
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(1.0)
-        hb = proto.Heartbeat(
-            sender_id=b"A" * 8, sequence=1, timestamp_ms=0,
-            query_target_id=b"\x00" * 8, own_payload=b"",
-        )
-        sock.sendto(hb.encode(cluster_key), ("127.0.0.1", port))
-        try:
-            data, _ = sock.recvfrom(MTU_CAP + 64)
-            # Allowed: UNKNOWN_SOURCE if rate-limit + seq check combined.
-            # Not allowed: a valid STATUS_LIST reply to a replayed packet.
-            assert data[4] != proto.MSG_STATUS_LIST, "replayed seq should be dropped"
-        except socket.timeout:
-            pass
-        sock.close()
-    finally:
-        loop.stop()
+def test_e2e_heartbeat_first_with_unknown_source_recovery(live_witness):
+    """First HEARTBEAT triggers UNKNOWN_SOURCE; NodeClient bootstraps then retries."""
+    w, addr, pub = live_witness
+    n = node.NodeClient(sender_id=0x01, cluster_key=CK,
+                        witness_addr=addr, witness_pubkey=pub)
+    sl = n.heartbeat_list(b"")
+    assert len(sl.entries) == 1
+    assert sl.entries[0].peer_sender_id == 0x01
+    # Witness should now have one cluster, one node
+    assert len(w.clusters) == 1
+    assert len(w.nodes) == 1
+
+
+def test_e2e_two_nodes_join_same_cluster(live_witness):
+    w, addr, pub = live_witness
+    a = node.NodeClient(0x01, CK, addr, pub)
+    b = node.NodeClient(0x02, CK, addr, pub)
+    a.heartbeat_list()
+    b.heartbeat_list()
+    sl = a.heartbeat_list()
+    sender_ids = {e.peer_sender_id for e in sl.entries}
+    assert sender_ids == {0x01, 0x02}
+
+
+def test_e2e_status_detail_for_peer(live_witness):
+    w, addr, pub = live_witness
+    a = node.NodeClient(0x01, CK, addr, pub)
+    b = node.NodeClient(0x02, CK, addr, pub)
+    a.heartbeat_list(b"\xAA" * 32)
+    payload_b = b"role=primary" + b"\x00" * (32 - 12)
+    b.heartbeat_list(payload_b)
+    # A queries B's detail
+    sd = a.heartbeat_detail(peer_sender_id=0x02, own_payload=b"\x00" * 32)
+    assert sd.found is True
+    assert sd.target_sender_id == 0x02
+    assert sd.peer_payload == payload_b
+
+
+def test_e2e_self_query_appendix_a_pattern(live_witness):
+    """Advertise-verify-act: send heartbeat with intent payload, then
+    self-query to confirm witness recorded it before acting."""
+    w, addr, pub = live_witness
+    a = node.NodeClient(0x01, CK, addr, pub)
+    intent = b"intent=promote-R" + b"\x00" * (32 - 16)
+    # Step 2: advertise
+    a.heartbeat_list(intent)
+    # Step 3: self-query to verify
+    detail = a.heartbeat_detail(peer_sender_id=0x01, own_payload=intent)
+    # The self-query's HB will have replaced the witness-stored payload with
+    # `intent` again, so:
+    assert detail.found is True
+    assert detail.peer_payload == intent
+    # Real act-decision logic would happen at the application layer.
+
+
+def test_e2e_explicit_bootstrap_roundtrip(live_witness):
+    w, addr, pub = live_witness
+    a = node.NodeClient(0x01, CK, addr, pub)
+    ack = a.bootstrap()
+    assert ack.status == 0x00  # new
+    # Re-bootstrap is idempotent
+    ack2 = a.bootstrap()
+    assert ack2.status == 0x01
+
+
+def test_e2e_aead_protects_payload_confidentiality(live_witness):
+    """Sniff the wire and confirm payload bytes are not in plaintext."""
+    w, addr, pub = live_witness
+    n = node.NodeClient(0x01, CK, addr, pub)
+    n.heartbeat_list()  # establish cluster
+    # Build a heartbeat with a recognizable plaintext signature
+    sentinel = b"PLAINTEXT-SENTINEL-DO-NOT-LEAK!\x00"  # 32 B
+    hb = proto.Heartbeat(sender_id=0x01, timestamp_ms=int(time.time() * 1000) + 1000,
+                         query_target_id=0xFF, own_payload=sentinel)
+    wire = hb.encode(CK)
+    # The header is plaintext (we don't expect to find sentinel there).
+    # The payload + tag is encrypted.
+    assert sentinel not in wire
+    # Decoding works fine with the right key
+    decoded = proto.decode_heartbeat(wire, CK)
+    assert decoded.own_payload == sentinel

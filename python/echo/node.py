@@ -1,120 +1,126 @@
-"""Bedrock Echo node-side client.
+"""Bedrock Echo node-side client (v1).
 
-Intended for use by the Python node daemon (successor to bedrock-failover.py).
-Stateful enough to track sequence numbers and auto-bootstrap on UNKNOWN_SOURCE.
+Stateful enough to track timestamps and auto-bootstrap on UNKNOWN_SOURCE.
+The flow is HEARTBEAT-first: we try heartbeat, and only fall back to
+BOOTSTRAP if the witness replies UNKNOWN_SOURCE (per PROTOCOL.md §13).
 """
 from __future__ import annotations
 
 import logging
 import socket
 import time
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
 
 from . import proto, crypto
-from .proto import (
-    Heartbeat, StatusList, StatusDetail, UnknownSource,
-    Bootstrap, BootstrapAck, Header,
-    ProtocolError, AuthError,
-    MSG_STATUS_LIST, MSG_STATUS_DETAIL, MSG_UNKNOWN_SOURCE, MSG_BOOTSTRAP_ACK,
-    HEADER_LEN, HMAC_LEN, MTU_CAP,
-)
 
 log = logging.getLogger("echo.node")
 
 
 @dataclass
 class NodeClient:
-    sender_id: bytes                         # this node's 8-byte id
+    sender_id: int                           # 0x00..0xFE
     cluster_key: bytes                       # 32 bytes
     witness_addr: tuple[str, int]            # (host, port)
-    witness_x25519_pub: bytes                # 32 bytes
+    witness_pubkey: bytes                    # X25519 public, 32 bytes
     recv_timeout_s: float = 2.0
-    _last_sent_seq: int = 0
-    _last_rx_seq: int = 0
+    _last_sent_ts: int = 0
 
     def __post_init__(self):
-        if len(self.sender_id) != 8:
-            raise ValueError("sender_id must be 8 bytes")
-        if len(self.cluster_key) != 32:
+        if not (0 <= self.sender_id <= proto.NODE_SENDER_ID_MAX):
+            raise ValueError("sender_id must be 0..0xFE")
+        if len(self.cluster_key) != proto.CLUSTER_KEY_LEN:
             raise ValueError("cluster_key must be 32 bytes")
-        if len(self.witness_x25519_pub) != 32:
-            raise ValueError("witness_x25519_pub must be 32 bytes")
+        if len(self.witness_pubkey) != proto.WITNESS_PUBKEY_LEN:
+            raise ValueError("witness_pubkey must be 32 bytes")
 
-    def _next_seq(self) -> int:
+    def _next_ts(self) -> int:
+        """Strict-monotonic-per-sender timestamp_ms (PROTOCOL.md §6.1)."""
         now = time.time_ns() // 1_000_000
-        s = max(now, self._last_sent_seq + 1)
-        self._last_sent_seq = s
-        return s
+        ts = max(now, self._last_sent_ts + 1)
+        self._last_sent_ts = ts
+        return ts
 
-    def _sendrecv(self, wire: bytes, sock: Optional[socket.socket] = None) -> bytes:
-        """Send one packet, wait for exactly one reply. Returns the reply bytes."""
+    def _sendrecv(self, wire: bytes, sock: socket.socket | None = None) -> bytes:
+        """Send one packet, wait for one reply, return reply bytes."""
         owned = sock is None
         if owned:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.settimeout(self.recv_timeout_s)
         try:
             sock.sendto(wire, self.witness_addr)
-            data, _ = sock.recvfrom(MTU_CAP + 64)
+            data, _ = sock.recvfrom(proto.MTU_CAP + 64)
             return data
         finally:
             if owned:
                 sock.close()
 
-    def bootstrap(self, init_payload: bytes = b"") -> BootstrapAck:
+    # ── BOOTSTRAP ──
+
+    def bootstrap(self) -> proto.BootstrapAck:
+        """Send a BOOTSTRAP, wait for ACK. Caller-friendly fallback used
+        only when HEARTBEAT-first hits UNKNOWN_SOURCE."""
         eph_priv, _ = crypto.x25519_generate()
-        bs = Bootstrap(
+        bs = proto.Bootstrap(
             sender_id=self.sender_id,
-            sequence=self._next_seq(),
-            timestamp_ms=time.time_ns() // 1_000_000,
+            timestamp_ms=self._next_ts(),
             cluster_key=self.cluster_key,
-            init_payload=init_payload,
         )
-        wire = bs.encode(self.witness_x25519_pub, eph_priv)
+        wire = bs.encode(self.witness_pubkey, eph_priv)
         reply = self._sendrecv(wire)
         ack = proto.decode_bootstrap_ack(reply, self.cluster_key)
-        log.info("bootstrap OK: status=%d witness_uptime=%dms",
-                 ack.status, ack.witness_uptime_ms)
-        self._last_rx_seq = ack.sequence
+        log.info("bootstrap OK: status=%d witness_uptime=%ds",
+                 ack.status, ack.witness_uptime_seconds)
         return ack
 
-    def heartbeat_list(self, own_payload: bytes = b"") -> StatusList:
-        """Send a heartbeat asking for the full peer list. Auto-bootstraps
-        on UNKNOWN_SOURCE."""
-        reply = self._heartbeat_core(b"\x00" * 8, own_payload)
+    # ── DISCOVER ──
+
+    def discover(self) -> proto.UnknownSource:
+        """Send a DISCOVER probe. Returns the witness's UNKNOWN_SOURCE reply
+        (which carries the witness's pubkey for verification)."""
+        d = proto.Discover(sender_id=self.sender_id, timestamp_ms=self._next_ts())
+        reply = self._sendrecv(d.encode())
+        return proto.decode_unknown_source(reply)
+
+    # ── HEARTBEAT — list query (peers + self) ──
+
+    def heartbeat_list(self, own_payload: bytes = b"") -> proto.StatusList:
+        reply = self._heartbeat_core(proto.QUERY_LIST_SENTINEL, own_payload)
         return proto.decode_status_list(reply, self.cluster_key)
 
-    def heartbeat_detail(self, peer_sender_id: bytes,
-                         own_payload: bytes = b"") -> StatusDetail:
-        """Send a heartbeat asking for the detailed state of one peer.
-        Auto-bootstraps on UNKNOWN_SOURCE."""
-        if len(peer_sender_id) != 8 or peer_sender_id == b"\x00" * 8:
-            raise ValueError("peer_sender_id must be 8 non-zero bytes")
+    # ── HEARTBEAT — detail query (one peer, may be self) ──
+
+    def heartbeat_detail(self, peer_sender_id: int,
+                         own_payload: bytes = b"") -> proto.StatusDetail:
+        if not (0 <= peer_sender_id <= proto.NODE_SENDER_ID_MAX):
+            raise ValueError("peer_sender_id must be 0..0xFE")
         reply = self._heartbeat_core(peer_sender_id, own_payload)
         return proto.decode_status_detail(reply, self.cluster_key)
 
-    def _heartbeat_core(self, target: bytes, own_payload: bytes) -> bytes:
-        hb = Heartbeat(
+    # ── core heartbeat with auto-bootstrap on UNKNOWN_SOURCE ──
+
+    def _heartbeat_core(self, target: int, own_payload: bytes) -> bytes:
+        hb = proto.Heartbeat(
             sender_id=self.sender_id,
-            sequence=self._next_seq(),
-            timestamp_ms=time.time_ns() // 1_000_000,
+            timestamp_ms=self._next_ts(),
             query_target_id=target,
             own_payload=own_payload,
         )
-        wire = hb.encode(self.cluster_key)
-        reply = self._sendrecv(wire)
-        # If it's UNKNOWN_SOURCE we bootstrap then retry once.
-        if len(reply) >= HEADER_LEN and reply[4] == MSG_UNKNOWN_SOURCE:
-            log.info("witness returned UNKNOWN_SOURCE, re-bootstrapping")
+        reply = self._sendrecv(hb.encode(self.cluster_key))
+        # If it's UNKNOWN_SOURCE, bootstrap once then retry.
+        if len(reply) == proto.UNKNOWN_SOURCE_LEN and reply[4] == proto.MSG_UNKNOWN_SOURCE:
+            us = proto.decode_unknown_source(reply)
+            if us.witness_pubkey != self.witness_pubkey:
+                raise proto.AuthError(
+                    "witness returned UNKNOWN_SOURCE but pubkey mismatch — "
+                    "possible MITM, refusing to BOOTSTRAP"
+                )
+            log.info("witness returned UNKNOWN_SOURCE, bootstrapping")
             self.bootstrap()
-            # retry the heartbeat
-            hb = Heartbeat(
+            hb = proto.Heartbeat(
                 sender_id=self.sender_id,
-                sequence=self._next_seq(),
-                timestamp_ms=time.time_ns() // 1_000_000,
+                timestamp_ms=self._next_ts(),
                 query_target_id=target,
                 own_payload=own_payload,
             )
-            wire = hb.encode(self.cluster_key)
-            reply = self._sendrecv(wire)
+            reply = self._sendrecv(hb.encode(self.cluster_key))
         return reply

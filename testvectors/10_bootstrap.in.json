@@ -1,0 +1,9 @@
+{
+  "description": "BOOTSTRAP delivering cluster_key (fixed eph_priv for reproducibility)",
+  "msg_type": "0x20 BOOTSTRAP",
+  "sender_id": 1,
+  "timestamp_ms": 1700000001000,
+  "cluster_key": "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f",
+  "witness_pubkey": "14ca9e4d387bccf35746e0407daaacc6b28a4f8445ef5a5158894db983e24070",
+  "eph_priv": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+}

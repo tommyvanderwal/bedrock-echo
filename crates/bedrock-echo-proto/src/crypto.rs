@@ -8,11 +8,11 @@
 //! HMAC-SHA256 has been removed in v1 — Poly1305 (built into AEAD)
 //! provides integrity for all authenticated messages.
 
-use crate::constants::{AEAD_TAG_LEN, HKDF_INFO};
+use crate::constants::{AEAD_TAG_LEN, COOKIE_LEN, HKDF_INFO};
 use crate::{Error, Result};
 
 use hkdf::Hkdf;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 /// Derive the public X25519 key from a private key.
@@ -33,6 +33,22 @@ pub fn hkdf_sha256(ikm: &[u8], out: &mut [u8; 32]) {
     let salt = [0u8; 32];
     let h = Hkdf::<Sha256>::new(Some(&salt), ikm);
     h.expand(HKDF_INFO, out).expect("32 is <= 8160 bytes");
+}
+
+/// Anti-spoof cookie (PROTOCOL.md §11.2):
+///   `cookie = SHA-256(witness_cookie_secret || src_ip_be)[:16]`
+///
+/// The witness emits this in INIT and validates it on BOOTSTRAP.
+/// `src_ip_be` is 4 bytes for IPv4 in network byte order. (BOOTSTRAP
+/// is IPv4-only in v1.)
+pub fn derive_cookie(witness_cookie_secret: &[u8; 32], src_ip_be: &[u8; 4]) -> [u8; COOKIE_LEN] {
+    let mut hasher = Sha256::new();
+    hasher.update(witness_cookie_secret);
+    hasher.update(src_ip_be);
+    let digest = hasher.finalize();
+    let mut out = [0u8; COOKIE_LEN];
+    out.copy_from_slice(&digest[..COOKIE_LEN]);
+    out
 }
 
 /// Encrypt with ChaCha20-Poly1305. Writes `ciphertext || tag` into `out`.

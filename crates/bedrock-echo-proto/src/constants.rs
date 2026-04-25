@@ -11,7 +11,7 @@ pub const MSG_HEARTBEAT: u8       = 0x01;
 pub const MSG_STATUS_LIST: u8     = 0x02;
 pub const MSG_STATUS_DETAIL: u8   = 0x03;
 pub const MSG_DISCOVER: u8        = 0x04;
-pub const MSG_UNKNOWN_SOURCE: u8  = 0x10;
+pub const MSG_INIT: u8            = 0x10;
 pub const MSG_BOOTSTRAP: u8       = 0x20;
 pub const MSG_BOOTSTRAP_ACK: u8   = 0x21;
 
@@ -36,10 +36,18 @@ pub const CLUSTER_KEY_LEN: usize = 32;
 pub const EPH_PUBKEY_LEN: usize = 32;
 pub const WITNESS_PUBKEY_LEN: usize = 32;
 
+// Anti-spoof cookie (PROTOCOL.md §11.2)
+pub const COOKIE_LEN: usize = 16;
+pub const WITNESS_COOKIE_SECRET_LEN: usize = 32;
+
+// DISCOVER zero-padding (anti-amp; PROTOCOL.md §1 principle 13, §5.4)
+pub const DISCOVER_PAD_LEN: usize = 48;
+
 // Total packet sizes (fixed for these types)
-pub const DISCOVER_LEN: usize = HEADER_LEN;
-pub const UNKNOWN_SOURCE_LEN: usize = HEADER_LEN + WITNESS_PUBKEY_LEN; // 46
-pub const BOOTSTRAP_LEN: usize = HEADER_LEN + EPH_PUBKEY_LEN + CLUSTER_KEY_LEN + AEAD_TAG_LEN; // 94
+pub const DISCOVER_LEN: usize = HEADER_LEN + DISCOVER_PAD_LEN;                // 62
+pub const INIT_LEN: usize = HEADER_LEN + WITNESS_PUBKEY_LEN + COOKIE_LEN;     // 62
+pub const BOOTSTRAP_LEN: usize = HEADER_LEN + COOKIE_LEN + EPH_PUBKEY_LEN
+    + CLUSTER_KEY_LEN + AEAD_TAG_LEN;                                         // 110
 pub const BOOTSTRAP_ACK_PLAINTEXT_LEN: usize = 5; // status + witness_uptime_seconds
 pub const BOOTSTRAP_ACK_LEN: usize = HEADER_LEN + BOOTSTRAP_ACK_PLAINTEXT_LEN + AEAD_TAG_LEN; // 35
 

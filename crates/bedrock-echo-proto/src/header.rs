@@ -62,7 +62,7 @@ fn is_known_msg_type(t: u8) -> bool {
             | MSG_STATUS_LIST
             | MSG_STATUS_DETAIL
             | MSG_DISCOVER
-            | MSG_UNKNOWN_SOURCE
+            | MSG_INIT
             | MSG_BOOTSTRAP
             | MSG_BOOTSTRAP_ACK
     )

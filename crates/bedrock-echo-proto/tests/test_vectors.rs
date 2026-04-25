@@ -41,6 +41,14 @@ fn ipv4_str_to_bytes(s: &str) -> [u8; 4] {
     [parts[0], parts[1], parts[2], parts[3]]
 }
 
+fn hex_to_arr16(s: &str) -> [u8; 16] {
+    let v = hex_to_vec(s);
+    assert_eq!(v.len(), 16);
+    let mut a = [0u8; 16];
+    a.copy_from_slice(&v);
+    a
+}
+
 #[test]
 fn vector_01_heartbeat_list_query() {
     let (j, expected) = load_vector("01_heartbeat_list_query");
@@ -195,17 +203,30 @@ fn vector_08_discover() {
 }
 
 #[test]
-fn vector_09_unknown_source() {
-    let (j, expected) = load_vector("09_unknown_source");
+fn vector_09_init() {
+    let (j, expected) = load_vector("09_init");
     let pub_arr = hex_to_arr32(j["witness_pubkey"].as_str().unwrap());
+    let cookie = hex_to_arr16(j["cookie"].as_str().unwrap());
     let mut out = vec![0u8; expected.len()];
-    msg::encode_unknown_source(
+    msg::encode_init(
         &mut out,
         j["timestamp_ms"].as_i64().unwrap(),
         &pub_arr,
+        &cookie,
     )
     .unwrap();
     assert_eq!(out, expected);
+
+    // Cross-check: cookie is SHA-256(witness_cookie_secret || src_ip)[:16].
+    let secret = hex_to_arr32(j["witness_cookie_secret"].as_str().unwrap());
+    let src_ip = ipv4_str_to_bytes(j["src_ip"].as_str().unwrap());
+    let derived = crypto::derive_cookie(&secret, &src_ip);
+    assert_eq!(derived, cookie);
+
+    // Round-trip decode
+    let r = msg::decode_init(&expected).unwrap();
+    assert_eq!(r.cookie, &cookie);
+    assert_eq!(r.witness_pubkey, &pub_arr);
 }
 
 #[test]
@@ -214,6 +235,7 @@ fn vector_10_bootstrap() {
     let cluster_key = hex_to_arr32(j["cluster_key"].as_str().unwrap());
     let witness_pubkey = hex_to_arr32(j["witness_pubkey"].as_str().unwrap());
     let eph_priv = hex_to_arr32(j["eph_priv"].as_str().unwrap());
+    let cookie = hex_to_arr16(j["cookie"].as_str().unwrap());
     let mut out = vec![0u8; expected.len()];
     msg::encode_bootstrap(
         &mut out,
@@ -222,6 +244,7 @@ fn vector_10_bootstrap() {
         &cluster_key,
         &witness_pubkey,
         &eph_priv,
+        &cookie,
     )
     .unwrap();
     assert_eq!(out, expected);
@@ -229,8 +252,10 @@ fn vector_10_bootstrap() {
     // Decode requires witness_priv (deterministic seed used in the generator).
     let witness_priv = [0xAAu8; 32];
     let mut buf = expected.clone();
-    let (_hdr, decoded_ck) = msg::decode_bootstrap(&mut buf, &witness_priv).unwrap();
+    let (_hdr, decoded_cookie, decoded_ck) =
+        msg::decode_bootstrap(&mut buf, &witness_priv).unwrap();
     assert_eq!(decoded_ck, cluster_key);
+    assert_eq!(decoded_cookie, cookie);
 }
 
 #[test]

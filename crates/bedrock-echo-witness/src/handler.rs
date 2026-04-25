@@ -4,15 +4,18 @@
 //! UDP datagram and returns 0 or 1 reply bytes. Driving from a UDP loop:
 //!     for reply in handle(...) { sock.sendto(reply.as_slice(), src) }
 //!
-//! Implements the v1 dispatch and lookup chain:
-//!   1. IP-first + sender_id → AEAD trial decrypt against cluster_keys
-//!   2. Fallback: sender_id only (handles IP change)
-//!   3. Fallback: AEAD trial against every cluster_key (new-node-join)
+//! v1 dispatch (post-polish):
+//!   - DISCOVER → INIT (with cookie for src_ip).
+//!   - BOOTSTRAP → cookie pre-check, then AEAD-decrypt cluster_key,
+//!     then create-or-update node entry.
+//!   - HEARTBEAT → strict (src_ip, sender_id) match only. No
+//!     sender_id-only fallback, no new-node-join AEAD scan. Mismatches
+//!     get a rate-limited INIT reply.
 
 use bedrock_echo_proto::constants::*;
 use bedrock_echo_proto::msg;
 
-use crate::state::{State, MAX_NODES};
+use crate::state::State;
 
 /// Reply buffer (max-MTU-sized).
 pub struct Reply {
@@ -58,11 +61,13 @@ fn handle_discover(state: &mut State, data: &[u8], src_ipv4: [u8; 4],
     if !state.allow_unknown(src_ipv4, now_ms) {
         return None;
     }
+    let cookie = state.cookie_for(&src_ipv4);
     let mut out = [0u8; MTU_CAP];
-    let n = msg::encode_unknown_source(
+    let n = msg::encode_init(
         &mut out,
         state.uptime_ms(now_ms) as i64,
         &state.witness_pub,
+        &cookie,
     )
     .ok()?;
     Some(Reply { buf: out, len: n })
@@ -72,6 +77,17 @@ fn handle_discover(state: &mut State, data: &[u8], src_ipv4: [u8; 4],
 
 fn handle_bootstrap(state: &mut State, data: &[u8], src_ipv4: [u8; 4],
                     src_port: u16, now_ms: u64) -> Option<Reply> {
+    if data.len() != BOOTSTRAP_LEN {
+        return None;
+    }
+    // Cookie pre-check (PROTOCOL.md §11.2). Done before AEAD/X25519 to
+    // keep the witness's CPU budget bounded under spoofed-source storms.
+    let cookie_in: &[u8; COOKIE_LEN] =
+        data[HEADER_LEN..HEADER_LEN + COOKIE_LEN].try_into().ok()?;
+    if !state.cookie_valid(&src_ipv4, cookie_in) {
+        return None;
+    }
+
     // We need to copy `data` into a mutable buffer for in-place AEAD decrypt.
     let mut buf = [0u8; MTU_CAP];
     if data.len() > buf.len() {
@@ -79,7 +95,8 @@ fn handle_bootstrap(state: &mut State, data: &[u8], src_ipv4: [u8; 4],
     }
     buf[..data.len()].copy_from_slice(data);
     let work = &mut buf[..data.len()];
-    let (hdr, cluster_key) = msg::decode_bootstrap(work, &state.witness_priv).ok()?;
+    let (hdr, _cookie, cluster_key) =
+        msg::decode_bootstrap(work, &state.witness_priv).ok()?;
 
     // Find existing entry with same (sender_id, cluster_key).
     let mut existing_idx: Option<usize> = None;
@@ -163,11 +180,13 @@ fn handle_bootstrap(state: &mut State, data: &[u8], src_ipv4: [u8; 4],
 
 // ── HEARTBEAT ─────────────────────────────────────────────────────────────
 
-/// Outcome of a single AEAD trial in the dispatch chain.
+/// Outcome of a single AEAD trial. AEAD success but rejected (replay,
+/// out-of-window timestamp) is `Drop` — the packet is consumed by this
+/// candidate and must NOT cascade to a new-node-join.
 enum HbOutcome {
-    NotMine,       // AEAD failed under this cluster_key — try next
-    Drop,          // AEAD succeeded but the packet should be silently dropped
-    Reply(Reply),  // accepted; here is the reply
+    NotMine,
+    Drop,
+    Reply(Reply),
 }
 
 fn handle_heartbeat(state: &mut State, data: &[u8], src_ipv4: [u8; 4],
@@ -175,54 +194,32 @@ fn handle_heartbeat(state: &mut State, data: &[u8], src_ipv4: [u8; 4],
     let hdr = bedrock_echo_proto::Header::unpack(data).ok()?;
     let sid = hdr.sender_id;
 
-    // Pass 1: candidates by (src_ip, sender_id), then sender_id only.
-    let mut candidates: heapless::Vec<usize, MAX_NODES> = heapless::Vec::new();
+    // Strict (src_ip, sender_id) match only (PROTOCOL.md §13.4,
+    // witness-implementation §1.2). No sender_id-only fallback, no
+    // new-node-join AEAD scan — those have been removed in v1 polish.
     if let Some(i) = state.find_node_by_ip_and_sender(&src_ipv4, sid) {
-        let _ = candidates.push(i);
-    }
-    if candidates.is_empty() {
-        for i in state.find_nodes_by_sender(sid) {
-            let _ = candidates.push(i);
-        }
-    }
-
-    for &cand_idx in candidates.iter() {
-        let cs = state.nodes[cand_idx].cluster_slot as usize;
+        let cs = state.nodes[i].cluster_slot as usize;
         let cluster_key = state.clusters[cs].cluster_key;
         match try_handle_existing_node(
-            state, data, src_ipv4, src_port, now_ms, cand_idx, cs, &cluster_key,
+            state, data, src_ipv4, src_port, now_ms, i, cs, &cluster_key,
         ) {
-            HbOutcome::NotMine => continue,
-            HbOutcome::Drop => return None,
+            HbOutcome::NotMine | HbOutcome::Drop => return None,
             HbOutcome::Reply(r) => return Some(r),
         }
     }
 
-    // Pass 2: new-node-join scan. Try AEAD against every cluster_key.
-    let cluster_count = state.clusters.len();
-    for cs in 0..cluster_count {
-        if !state.clusters[cs].in_use {
-            continue;
-        }
-        let cluster_key = state.clusters[cs].cluster_key;
-        match try_handle_new_node(
-            state, data, src_ipv4, src_port, now_ms, sid, cs, &cluster_key,
-        ) {
-            HbOutcome::NotMine => continue,
-            HbOutcome::Drop => return None,
-            HbOutcome::Reply(r) => return Some(r),
-        }
-    }
-
-    // Nothing matched — UNKNOWN_SOURCE if rate limit allows.
+    // No matching entry. Reply INIT (with fresh cookie) so the caller
+    // can re-BOOTSTRAP — subject to per-IP 1/s INIT rate limit.
     if !state.allow_unknown(src_ipv4, now_ms) {
         return None;
     }
+    let cookie = state.cookie_for(&src_ipv4);
     let mut out = [0u8; MTU_CAP];
-    let n = msg::encode_unknown_source(
+    let n = msg::encode_init(
         &mut out,
         state.uptime_ms(now_ms) as i64,
         &state.witness_pub,
+        &cookie,
     )
     .ok()?;
     Some(Reply { buf: out, len: n })
@@ -274,67 +271,6 @@ fn try_handle_existing_node(
         n.payload_n_blocks = (payload.len() / PAYLOAD_BLOCK_SIZE) as u8;
         n.payload[..payload.len()].copy_from_slice(&payload_owned);
     }
-
-    HbOutcome::Reply(build_heartbeat_reply(state, qt, cluster_slot, uptime_ms, *cluster_key))
-}
-
-fn try_handle_new_node(
-    state: &mut State,
-    data: &[u8],
-    src_ipv4: [u8; 4],
-    src_port: u16,
-    now_ms: u64,
-    sender_id: u8,
-    cluster_slot: usize,
-    cluster_key: &[u8; CLUSTER_KEY_LEN],
-) -> HbOutcome {
-    let mut buf = [0u8; MTU_CAP];
-    if data.len() > buf.len() {
-        return HbOutcome::NotMine;
-    }
-    buf[..data.len()].copy_from_slice(data);
-    let work = &mut buf[..data.len()];
-
-    let (hdr, qt, payload) = match msg::decode_heartbeat_into(work, cluster_key) {
-        Ok(v) => v,
-        Err(_) => return HbOutcome::NotMine,
-    };
-
-    // Belt-and-suspenders: if pass 1 didn't find an entry but one already
-    // exists for (sender_id, this cluster), don't double-allocate.
-    if state.nodes.iter().any(|n|
-        n.in_use && n.sender_id == sender_id && n.cluster_slot as usize == cluster_slot
-    ) {
-        return HbOutcome::Drop;
-    }
-
-    let uptime_ms = state.uptime_ms(now_ms);
-    if !state.adapt_cluster_offset(cluster_slot, hdr.timestamp_ms, uptime_ms) {
-        return HbOutcome::Drop;
-    }
-
-    let ns = match state.allocate_node_slot() {
-        Some(s) => s,
-        None => return HbOutcome::Drop,
-    };
-    let payload_owned = match heapless::Vec::<u8, PAYLOAD_MAX_BYTES>::from_slice(payload) {
-        Ok(v) => v,
-        Err(_) => return HbOutcome::Drop,
-    };
-    state.nodes[ns] = crate::state::NodeEntry {
-        in_use: true,
-        sender_id,
-        sender_ipv4: src_ipv4,
-        sender_src_port: src_port,
-        cluster_slot: cluster_slot as u16,
-        last_rx_ms: now_ms,
-        last_rx_timestamp: hdr.timestamp_ms,
-        payload_n_blocks: (payload.len() / PAYLOAD_BLOCK_SIZE) as u8,
-        payload: [0; PAYLOAD_MAX_BYTES],
-    };
-    state.nodes[ns].payload[..payload.len()].copy_from_slice(&payload_owned);
-    state.clusters[cluster_slot].num_nodes =
-        state.clusters[cluster_slot].num_nodes.saturating_add(1);
 
     HbOutcome::Reply(build_heartbeat_reply(state, qt, cluster_slot, uptime_ms, *cluster_key))
 }

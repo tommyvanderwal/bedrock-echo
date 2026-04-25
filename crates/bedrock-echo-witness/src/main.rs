@@ -65,7 +65,15 @@ fn main() {
     let bind = parse_bind();
     let key_path = key_path();
     let priv_key = load_or_generate_priv(&key_path);
-    let mut state = State::new(priv_key, now_ms());
+    // Generate two random cookie secrets at boot — current and previous
+    // both fresh, so all in-flight cookies from a (rare) prior witness
+    // session are invalidated. Hourly rotation runs lazily in the
+    // packet handler.
+    let mut current = [0u8; 32];
+    let mut previous = [0u8; 32];
+    OsRng.fill_bytes(&mut current);
+    OsRng.fill_bytes(&mut previous);
+    let mut state = State::new_with_cookies(priv_key, now_ms(), current, previous);
 
     eprintln!("bedrock-echo-witness v{} starting", env!("CARGO_PKG_VERSION"));
     eprintln!("  bind:           {}", bind);
@@ -77,6 +85,12 @@ fn main() {
     loop {
         match sock.recv_from(&mut buf) {
             Ok((len, src)) => {
+                let t = now_ms();
+                if state.cookie_rotation_due(t) {
+                    let mut next = [0u8; 32];
+                    OsRng.fill_bytes(&mut next);
+                    state.maybe_rotate_cookie(t, next);
+                }
                 let ipv4 = match src.ip() {
                     IpAddr::V4(v4) => v4.octets(),
                     IpAddr::V6(v6) => match v6.to_ipv4_mapped() {

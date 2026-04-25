@@ -70,6 +70,9 @@ pub const RL_UNKNOWN_MIN_INTERVAL_MS: u64 = 1000;
 pub const MAX_BACKWARD_JUMP_MS: i64 = 1000;
 pub const MAX_BACKWARD_STEP_MS: i64 = 10;
 
+/// Cookie-secret rotation period (PROTOCOL.md §11.2).
+pub const COOKIE_SECRET_ROTATION_MS: u64 = 3600 * 1000; // 1 hour
+
 pub struct State {
     pub witness_priv: [u8; 32],
     pub witness_pub: [u8; 32],
@@ -77,10 +80,32 @@ pub struct State {
     pub clusters: [ClusterEntry; MAX_CLUSTERS],
     pub nodes: [NodeEntry; MAX_NODES],
     pub rate_limits: [RateEntry; MAX_TRACKED_IPS],
+    // Anti-spoof cookie state (PROTOCOL.md §11.2). Witness rotates the
+    // secret hourly and accepts both current+previous on incoming
+    // BOOTSTRAPs.
+    pub cookie_current: [u8; WITNESS_COOKIE_SECRET_LEN],
+    pub cookie_previous: [u8; WITNESS_COOKIE_SECRET_LEN],
+    pub last_cookie_rotation_ms: u64,
 }
 
 impl State {
     pub fn new(witness_priv: [u8; 32], now_ms: u64) -> Self {
+        Self::new_with_cookies(witness_priv, now_ms,
+                               // Default to all-zero cookie secrets; the binary
+                               // entry point should override these via random
+                               // bytes before going live. Tests pass fixed
+                               // secrets via new_with_cookies for byte-exact
+                               // reproducibility.
+                               [0u8; WITNESS_COOKIE_SECRET_LEN],
+                               [0u8; WITNESS_COOKIE_SECRET_LEN])
+    }
+
+    pub fn new_with_cookies(
+        witness_priv: [u8; 32],
+        now_ms: u64,
+        cookie_current: [u8; WITNESS_COOKIE_SECRET_LEN],
+        cookie_previous: [u8; WITNESS_COOKIE_SECRET_LEN],
+    ) -> Self {
         let witness_pub = bedrock_echo_proto::crypto::x25519_pub_from_priv(&witness_priv);
         Self {
             witness_priv,
@@ -89,7 +114,45 @@ impl State {
             clusters: [ClusterEntry::default(); MAX_CLUSTERS],
             nodes: [NodeEntry::default(); MAX_NODES],
             rate_limits: [RateEntry::default(); MAX_TRACKED_IPS],
+            cookie_current,
+            cookie_previous,
+            last_cookie_rotation_ms: now_ms,
         }
+    }
+
+    /// True when a cookie-secret rotation is due (≥ 1 hour since the last).
+    /// Cheap O(1); the bin's main loop should poll this and supply
+    /// fresh randomness via `maybe_rotate_cookie` when it returns true.
+    pub fn cookie_rotation_due(&self, now_ms: u64) -> bool {
+        now_ms.saturating_sub(self.last_cookie_rotation_ms)
+            >= COOKIE_SECRET_ROTATION_MS
+    }
+
+    /// Lazy hourly cookie rotation (PROTOCOL.md §11.2).
+    /// `new_secret` is supplied by the caller — the proto crate is
+    /// `no_std` and doesn't depend on a randomness source.
+    pub fn maybe_rotate_cookie(
+        &mut self,
+        now_ms: u64,
+        new_secret: [u8; WITNESS_COOKIE_SECRET_LEN],
+    ) {
+        if !self.cookie_rotation_due(now_ms) {
+            return;
+        }
+        self.cookie_previous = self.cookie_current;
+        self.cookie_current = new_secret;
+        self.last_cookie_rotation_ms = now_ms;
+    }
+
+    /// Compute the cookie a node at `src_ip` should echo on its next BOOTSTRAP.
+    pub fn cookie_for(&self, src_ip: &[u8; 4]) -> [u8; COOKIE_LEN] {
+        bedrock_echo_proto::crypto::derive_cookie(&self.cookie_current, src_ip)
+    }
+
+    /// Validate `cookie` against the current OR previous secret for `src_ip`.
+    pub fn cookie_valid(&self, src_ip: &[u8; 4], cookie: &[u8; COOKIE_LEN]) -> bool {
+        bedrock_echo_proto::crypto::derive_cookie(&self.cookie_current, src_ip) == *cookie
+            || bedrock_echo_proto::crypto::derive_cookie(&self.cookie_previous, src_ip) == *cookie
     }
 
     pub fn uptime_ms(&self, now_ms: u64) -> u64 {

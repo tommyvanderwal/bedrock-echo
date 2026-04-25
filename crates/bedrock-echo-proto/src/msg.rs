@@ -405,7 +405,7 @@ pub fn decode_status_detail_into<'a>(
     })
 }
 
-// ── DISCOVER (0x04) — node → witness, unauthenticated ────────────────────
+// ── DISCOVER (0x04) — node → witness, unauthenticated, zero-padded ──────
 
 pub fn encode_discover(
     out: &mut [u8],
@@ -418,6 +418,10 @@ pub fn encode_discover(
     }
     let hdr = Header { msg_type: MSG_DISCOVER, sender_id, timestamp_ms };
     hdr.pack(&mut out[..HEADER_LEN]);
+    // Zero-pad bytes 14..62 so request size == INIT reply size (anti-amp).
+    for b in &mut out[HEADER_LEN..DISCOVER_LEN] {
+        *b = 0;
+    }
     Ok(DISCOVER_LEN)
 }
 
@@ -430,49 +434,68 @@ pub fn decode_discover(buf: &[u8]) -> Result<Header> {
         return Err(Error::BadMsgType);
     }
     validate_node_sender_id(hdr.sender_id)?;
+    // Spec says senders MUST zero the 48 padding bytes; receivers MAY
+    // check. We don't enforce zero-only here so the witness stays
+    // forward-compatible if a future flag uses one of those bytes.
     Ok(hdr)
 }
 
-// ── UNKNOWN_SOURCE (0x10) — witness → node, unauthenticated ──────────────
+// ── INIT (0x10) — witness → node, unauthenticated ────────────────────────
 
-pub fn encode_unknown_source(
+pub fn encode_init(
     out: &mut [u8],
     timestamp_ms: i64,
     witness_pubkey: &[u8; WITNESS_PUBKEY_LEN],
+    cookie: &[u8; COOKIE_LEN],
 ) -> Result<usize> {
-    if out.len() < UNKNOWN_SOURCE_LEN {
+    if out.len() < INIT_LEN {
         return Err(Error::BadLength);
     }
     let hdr = Header {
-        msg_type: MSG_UNKNOWN_SOURCE,
+        msg_type: MSG_INIT,
         sender_id: WITNESS_SENDER_ID,
         timestamp_ms,
     };
     hdr.pack(&mut out[..HEADER_LEN]);
     out[HEADER_LEN..HEADER_LEN + WITNESS_PUBKEY_LEN].copy_from_slice(witness_pubkey);
-    Ok(UNKNOWN_SOURCE_LEN)
+    out[HEADER_LEN + WITNESS_PUBKEY_LEN..INIT_LEN].copy_from_slice(cookie);
+    Ok(INIT_LEN)
 }
 
-pub struct UnknownSourceReader<'a> {
+pub struct InitReader<'a> {
     pub header: Header,
     pub witness_pubkey: &'a [u8; WITNESS_PUBKEY_LEN],
+    pub cookie: &'a [u8; COOKIE_LEN],
 }
 
-pub fn decode_unknown_source(buf: &[u8]) -> Result<UnknownSourceReader<'_>> {
-    if buf.len() != UNKNOWN_SOURCE_LEN {
+pub fn decode_init(buf: &[u8]) -> Result<InitReader<'_>> {
+    if buf.len() != INIT_LEN {
         return Err(Error::BadLength);
     }
     let hdr = Header::unpack(buf)?;
-    if hdr.msg_type != MSG_UNKNOWN_SOURCE {
+    if hdr.msg_type != MSG_INIT {
         return Err(Error::BadMsgType);
     }
     validate_witness_sender_id(hdr.sender_id)?;
     let witness_pubkey: &[u8; WITNESS_PUBKEY_LEN] =
         buf[HEADER_LEN..HEADER_LEN + WITNESS_PUBKEY_LEN].try_into().unwrap();
-    Ok(UnknownSourceReader { header: hdr, witness_pubkey })
+    let cookie: &[u8; COOKIE_LEN] =
+        buf[HEADER_LEN + WITNESS_PUBKEY_LEN..INIT_LEN].try_into().unwrap();
+    Ok(InitReader { header: hdr, witness_pubkey, cookie })
 }
 
 // ── BOOTSTRAP (0x20) — node → witness, AEAD via ECDH ─────────────────────
+//
+// Layout (PROTOCOL.md §5.6):
+//   [0..14]   header (in AAD)
+//   [14..30]  cookie (in AAD; PROTOCOL.md §11.2)
+//   [30..62]  eph_pubkey (plaintext)
+//   [62..94]  encrypted cluster_key
+//   [94..110] Poly1305 tag
+
+const BOOTSTRAP_AAD_LEN: usize = HEADER_LEN + COOKIE_LEN; // 30
+const BOOTSTRAP_EPH_OFF: usize = BOOTSTRAP_AAD_LEN;       // 30
+const BOOTSTRAP_CT_OFF: usize = BOOTSTRAP_EPH_OFF + EPH_PUBKEY_LEN; // 62
 
 pub fn encode_bootstrap(
     out: &mut [u8],
@@ -481,6 +504,7 @@ pub fn encode_bootstrap(
     cluster_key: &[u8; CLUSTER_KEY_LEN],
     witness_pubkey: &[u8; WITNESS_PUBKEY_LEN],
     eph_priv: &[u8; 32],
+    cookie: &[u8; COOKIE_LEN],
 ) -> Result<usize> {
     validate_node_sender_id(sender_id)?;
     if out.len() < BOOTSTRAP_LEN {
@@ -493,14 +517,13 @@ pub fn encode_bootstrap(
 
     let hdr = Header { msg_type: MSG_BOOTSTRAP, sender_id, timestamp_ms };
     hdr.pack(&mut out[..HEADER_LEN]);
-    out[HEADER_LEN..HEADER_LEN + EPH_PUBKEY_LEN].copy_from_slice(&eph_pub);
+    out[HEADER_LEN..HEADER_LEN + COOKIE_LEN].copy_from_slice(cookie);
+    out[BOOTSTRAP_EPH_OFF..BOOTSTRAP_EPH_OFF + EPH_PUBKEY_LEN].copy_from_slice(&eph_pub);
 
-    let aad = {
-        // Borrow header bytes immutably from out; need separate scope.
-        let mut tmp = [0u8; HEADER_LEN];
-        tmp.copy_from_slice(&out[..HEADER_LEN]);
-        tmp
-    };
+    // AAD = header || cookie (first 30 bytes). Copy out for the AEAD call.
+    let mut aad = [0u8; BOOTSTRAP_AAD_LEN];
+    aad.copy_from_slice(&out[..BOOTSTRAP_AAD_LEN]);
+
     let mut ct_buf = [0u8; CLUSTER_KEY_LEN + AEAD_TAG_LEN];
     let n = crypto::aead_encrypt(
         &aead_key,
@@ -509,15 +532,14 @@ pub fn encode_bootstrap(
         cluster_key,
         &mut ct_buf,
     )?;
-    out[HEADER_LEN + EPH_PUBKEY_LEN..HEADER_LEN + EPH_PUBKEY_LEN + n]
-        .copy_from_slice(&ct_buf[..n]);
+    out[BOOTSTRAP_CT_OFF..BOOTSTRAP_CT_OFF + n].copy_from_slice(&ct_buf[..n]);
     Ok(BOOTSTRAP_LEN)
 }
 
 pub fn decode_bootstrap(
     buf: &mut [u8],
     witness_priv: &[u8; 32],
-) -> Result<(Header, [u8; CLUSTER_KEY_LEN])> {
+) -> Result<(Header, [u8; COOKIE_LEN], [u8; CLUSTER_KEY_LEN])> {
     if buf.len() != BOOTSTRAP_LEN {
         return Err(Error::BadLength);
     }
@@ -527,30 +549,32 @@ pub fn decode_bootstrap(
     }
     validate_node_sender_id(hdr.sender_id)?;
 
+    let mut cookie = [0u8; COOKIE_LEN];
+    cookie.copy_from_slice(&buf[HEADER_LEN..HEADER_LEN + COOKIE_LEN]);
+
     let mut eph_pub = [0u8; EPH_PUBKEY_LEN];
-    eph_pub.copy_from_slice(&buf[HEADER_LEN..HEADER_LEN + EPH_PUBKEY_LEN]);
+    eph_pub.copy_from_slice(&buf[BOOTSTRAP_EPH_OFF..BOOTSTRAP_EPH_OFF + EPH_PUBKEY_LEN]);
     let shared = crypto::x25519_shared(witness_priv, &eph_pub);
     let mut aead_key = [0u8; 32];
     crypto::hkdf_sha256(&shared, &mut aead_key);
 
-    // AAD = first 14 bytes (header). Copy out before mutable split.
-    let mut aad = [0u8; HEADER_LEN];
-    aad.copy_from_slice(&buf[..HEADER_LEN]);
+    // AAD = header || cookie (first 30 bytes). Copy out before mutable split.
+    let mut aad = [0u8; BOOTSTRAP_AAD_LEN];
+    aad.copy_from_slice(&buf[..BOOTSTRAP_AAD_LEN]);
 
     // Decrypt the ciphertext+tag in place.
-    let ct_start = HEADER_LEN + EPH_PUBKEY_LEN;
     let pt_len = crypto::aead_decrypt(
         &aead_key,
         &BOOTSTRAP_NONCE,
         &aad,
-        &mut buf[ct_start..],
+        &mut buf[BOOTSTRAP_CT_OFF..],
     )?;
     if pt_len != CLUSTER_KEY_LEN {
         return Err(Error::BadLength);
     }
     let mut cluster_key = [0u8; CLUSTER_KEY_LEN];
-    cluster_key.copy_from_slice(&buf[ct_start..ct_start + CLUSTER_KEY_LEN]);
-    Ok((hdr, cluster_key))
+    cluster_key.copy_from_slice(&buf[BOOTSTRAP_CT_OFF..BOOTSTRAP_CT_OFF + CLUSTER_KEY_LEN]);
+    Ok((hdr, cookie, cluster_key))
 }
 
 // ── BOOTSTRAP_ACK (0x21) — witness → node ────────────────────────────────

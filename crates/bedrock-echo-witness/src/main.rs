@@ -4,9 +4,6 @@
 //! The X25519 private key is persisted to a single file (default
 //! `/var/lib/bedrock-echo/witness.x25519.key`, override with `BEDROCK_ECHO_KEY`).
 
-mod handler;
-mod state;
-
 use std::fs;
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
@@ -15,10 +12,8 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bedrock_echo_proto::constants::MTU_CAP;
+use bedrock_echo_witness::{handle, State};
 use rand_core::{OsRng, RngCore};
-
-use handler::handle;
-use state::State;
 
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
@@ -76,7 +71,6 @@ fn main() {
     eprintln!("  bind:           {}", bind);
     eprintln!("  keyfile:        {}", key_path.display());
     eprintln!("  witness pub:    {}", hex_encode(&state.witness_pub));
-    eprintln!("  witness senderid: {}", hex_encode(&state.witness_sender_id));
 
     let sock = UdpSocket::bind(bind).expect("bind UDP socket");
     let mut buf = [0u8; MTU_CAP + 64];
@@ -93,7 +87,7 @@ fn main() {
                         }
                     },
                 };
-                if let Some(reply) = handle(&mut state, &buf[..len], ipv4, now_ms()) {
+                if let Some(reply) = handle(&mut state, &buf[..len], ipv4, src.port(), now_ms()) {
                     if let Err(e) = sock.send_to(reply.as_slice(), src) {
                         eprintln!("sendto {}: {}", src, e);
                     }

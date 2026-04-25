@@ -7,13 +7,12 @@ description = "Bedrock Echo witness protocol — wire format + crypto core (no_s
 
 [dependencies]
 # All of these support no_std. Keep this list minimal — every dep has to build
-# on ESP32.
-sha2            = { version = "0.10", default-features = false }
-hmac            = { version = "0.12", default-features = false }
-hkdf            = { version = "0.12", default-features = false }
-x25519-dalek    = { version = "2", default-features = false, features = ["static_secrets"] }
+# on ESP32. HMAC dropped in v1: Poly1305 (built into AEAD) covers integrity
+# on all authenticated messages.
+sha2             = { version = "0.10", default-features = false }
+hkdf             = { version = "0.12", default-features = false }
+x25519-dalek     = { version = "2", default-features = false, features = ["static_secrets"] }
 chacha20poly1305 = { version = "0.10", default-features = false }
-subtle          = { version = "2.5", default-features = false }
 
 [dev-dependencies]
 hex = "0.4"

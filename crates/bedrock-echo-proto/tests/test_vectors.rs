@@ -1,248 +1,290 @@
-//! Interop test: the Rust proto crate MUST produce (and accept) the exact
-//! same byte sequences as the Python reference impl, for every checked-in
-//! test vector under `testvectors/`.
+//! Cross-language test-vector validation for the Rust implementation.
 //!
-//! If this test fails, either the Python or Rust impl has drifted from
-//! PROTOCOL.md — and both are presumed broken until the drift is resolved.
+//! Loads each `.in.json` + `.out.bin` pair from `testvectors/`, verifies
+//! that the Rust encoder produces byte-exact `.out.bin`, and that decoding
+//! `.out.bin` round-trips to the same fields.
 
 use std::fs;
 use std::path::PathBuf;
 
-use bedrock_echo_proto::{constants::*, msg};
-
+use bedrock_echo_proto::*;
 use serde_json::Value;
 
-fn vectors_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent().unwrap()  // crates/
-        .parent().unwrap()  // repo root
-        .join("testvectors")
+fn vector_dir() -> PathBuf {
+    let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    here.parent().unwrap().parent().unwrap().join("testvectors")
 }
 
-fn hex_bytes(v: &Value) -> Vec<u8> {
-    hex::decode(v.as_str().unwrap()).unwrap()
+fn load_vector(name: &str) -> (Value, Vec<u8>) {
+    let dir = vector_dir();
+    let json_path = dir.join(format!("{name}.in.json"));
+    let bin_path = dir.join(format!("{name}.out.bin"));
+    let json = serde_json::from_str(&fs::read_to_string(&json_path).unwrap()).unwrap();
+    let bin = fs::read(&bin_path).unwrap();
+    (json, bin)
 }
 
-fn hex_arr<const N: usize>(v: &Value) -> [u8; N] {
-    let h = hex::decode(v.as_str().unwrap()).unwrap();
-    assert_eq!(h.len(), N, "hex length {} != {}", h.len(), N);
-    let mut out = [0u8; N];
-    out.copy_from_slice(&h);
-    out
+fn hex_to_vec(s: &str) -> Vec<u8> {
+    hex::decode(s).expect("valid hex")
 }
 
-fn parse_ipv4(v: &Value) -> [u8; 4] {
-    let s = v.as_str().unwrap();
-    let parts: Vec<u8> = s.split('.').map(|p| p.parse::<u8>().unwrap()).collect();
+fn hex_to_arr32(s: &str) -> [u8; 32] {
+    let v = hex_to_vec(s);
+    assert_eq!(v.len(), 32);
+    let mut a = [0u8; 32];
+    a.copy_from_slice(&v);
+    a
+}
+
+fn ipv4_str_to_bytes(s: &str) -> [u8; 4] {
+    let parts: Vec<u8> = s.split('.').map(|p| p.parse().unwrap()).collect();
     [parts[0], parts[1], parts[2], parts[3]]
 }
 
-fn load_pair(name: &str) -> (Value, Vec<u8>) {
-    let dir = vectors_dir();
-    let json = fs::read_to_string(dir.join(format!("{}.in.json", name))).unwrap();
-    let wire = fs::read(dir.join(format!("{}.out.bin", name))).unwrap();
-    (serde_json::from_str(&json).unwrap(), wire)
-}
-
-// ─── Encoders must match wire bytes exactly ─────────────────────────────────
-
 #[test]
-fn v01_heartbeat_list_query_encode_matches() {
-    let (inp, wire) = load_pair("01_heartbeat_list_query");
-    let mut out = [0u8; MTU_CAP];
+fn vector_01_heartbeat_list_query() {
+    let (j, expected) = load_vector("01_heartbeat_list_query");
+    let ck = hex_to_arr32(j["cluster_key"].as_str().unwrap());
+    let payload = hex_to_vec(j["own_payload"].as_str().unwrap());
+    let mut out = vec![0u8; expected.len()];
     let n = msg::encode_heartbeat(
         &mut out,
-        hex_arr::<8>(&inp["sender_id"]),
-        inp["sequence"].as_u64().unwrap(),
-        inp["timestamp_ms"].as_i64().unwrap(),
-        &hex_arr::<8>(&inp["query_target_id"]),
-        &hex_bytes(&inp["own_payload"]),
-        &hex_bytes(&inp["cluster_key"]),
-    ).unwrap();
-    assert_eq!(&out[..n], &wire[..], "heartbeat list-query encoding differs");
+        j["sender_id"].as_u64().unwrap() as u8,
+        j["timestamp_ms"].as_i64().unwrap(),
+        j["query_target_id"].as_u64().unwrap() as u8,
+        &payload,
+        &ck,
+    )
+    .unwrap();
+    assert_eq!(n, expected.len());
+    assert_eq!(out, expected);
+
+    // round-trip decode
+    let mut buf = expected.clone();
+    let (hdr, qt, pl) = msg::decode_heartbeat_into(&mut buf, &ck).unwrap();
+    assert_eq!(hdr.sender_id, j["sender_id"].as_u64().unwrap() as u8);
+    assert_eq!(qt, j["query_target_id"].as_u64().unwrap() as u8);
+    assert_eq!(pl, payload.as_slice());
 }
 
 #[test]
-fn v02_heartbeat_detail_query_encode_matches() {
-    let (inp, wire) = load_pair("02_heartbeat_detail_query");
-    let mut out = [0u8; MTU_CAP];
-    let n = msg::encode_heartbeat(
+fn vector_02_heartbeat_detail_query() {
+    let (j, expected) = load_vector("02_heartbeat_detail_query");
+    let ck = hex_to_arr32(j["cluster_key"].as_str().unwrap());
+    let payload = hex_to_vec(j["own_payload"].as_str().unwrap());
+    let mut out = vec![0u8; expected.len()];
+    msg::encode_heartbeat(
         &mut out,
-        hex_arr::<8>(&inp["sender_id"]),
-        inp["sequence"].as_u64().unwrap(),
-        inp["timestamp_ms"].as_i64().unwrap(),
-        &hex_arr::<8>(&inp["query_target_id"]),
-        &hex_bytes(&inp["own_payload"]),
-        &hex_bytes(&inp["cluster_key"]),
-    ).unwrap();
-    assert_eq!(&out[..n], &wire[..]);
+        j["sender_id"].as_u64().unwrap() as u8,
+        j["timestamp_ms"].as_i64().unwrap(),
+        j["query_target_id"].as_u64().unwrap() as u8,
+        &payload,
+        &ck,
+    )
+    .unwrap();
+    assert_eq!(out, expected);
 }
 
 #[test]
-fn v03_status_list_two_nodes_encode_matches() {
-    let (inp, wire) = load_pair("03_status_list_two_nodes");
-    let entries: Vec<msg::ListEntry> = inp["entries"].as_array().unwrap().iter()
+fn vector_03_heartbeat_self_query() {
+    let (j, expected) = load_vector("03_heartbeat_self_query");
+    let ck = hex_to_arr32(j["cluster_key"].as_str().unwrap());
+    let payload = hex_to_vec(j["own_payload"].as_str().unwrap());
+    let mut out = vec![0u8; expected.len()];
+    msg::encode_heartbeat(
+        &mut out,
+        j["sender_id"].as_u64().unwrap() as u8,
+        j["timestamp_ms"].as_i64().unwrap(),
+        j["query_target_id"].as_u64().unwrap() as u8,
+        &payload,
+        &ck,
+    )
+    .unwrap();
+    assert_eq!(out, expected);
+}
+
+#[test]
+fn vector_04_status_list_two_nodes() {
+    let (j, expected) = load_vector("04_status_list_two_nodes");
+    let ck = hex_to_arr32(j["cluster_key"].as_str().unwrap());
+    let entries: Vec<msg::ListEntry> = j["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
         .map(|e| msg::ListEntry {
-            peer_sender_id: hex_arr::<8>(&e["peer_sender_id"]),
-            peer_ipv4: parse_ipv4(&e["peer_ipv4"]),
-            last_seen_seconds: e["last_seen_seconds"].as_u64().unwrap() as u32,
-        }).collect();
-    let mut out = [0u8; MTU_CAP];
-    let n = msg::encode_status_list(
+            peer_sender_id: e["peer_sender_id"].as_u64().unwrap() as u8,
+            last_seen_ms: e["last_seen_ms"].as_u64().unwrap() as u32,
+        })
+        .collect();
+    let mut out = vec![0u8; expected.len()];
+    msg::encode_status_list(
         &mut out,
-        hex_arr::<8>(&inp["witness_sender_id"]),
-        inp["sequence"].as_u64().unwrap(),
-        inp["timestamp_ms"].as_i64().unwrap(),
-        inp["witness_uptime_ms"].as_u64().unwrap(),
+        j["timestamp_ms"].as_i64().unwrap(),
+        j["witness_uptime_seconds"].as_u64().unwrap() as u32,
         &entries,
-        &hex_bytes(&inp["cluster_key"]),
-    ).unwrap();
-    assert_eq!(&out[..n], &wire[..]);
+        &ck,
+    )
+    .unwrap();
+    assert_eq!(out, expected);
 }
 
 #[test]
-fn v04_status_detail_found_encode_matches() {
-    let (inp, wire) = load_pair("04_status_detail_found");
-    let mut out = [0u8; MTU_CAP];
-    let n = msg::encode_status_detail_found(
+fn vector_05_status_list_empty() {
+    let (j, expected) = load_vector("05_status_list_empty");
+    let ck = hex_to_arr32(j["cluster_key"].as_str().unwrap());
+    let mut out = vec![0u8; expected.len()];
+    msg::encode_status_list(
         &mut out,
-        hex_arr::<8>(&inp["witness_sender_id"]),
-        inp["sequence"].as_u64().unwrap(),
-        inp["timestamp_ms"].as_i64().unwrap(),
-        inp["witness_uptime_ms"].as_u64().unwrap(),
-        &hex_arr::<8>(&inp["target_sender_id"]),
-        &parse_ipv4(&inp["peer_ipv4"]),
-        inp["last_seen_seconds"].as_u64().unwrap() as u32,
-        &hex_bytes(&inp["peer_payload"]),
-        &hex_bytes(&inp["cluster_key"]),
-    ).unwrap();
-    assert_eq!(&out[..n], &wire[..]);
+        j["timestamp_ms"].as_i64().unwrap(),
+        j["witness_uptime_seconds"].as_u64().unwrap() as u32,
+        &[],
+        &ck,
+    )
+    .unwrap();
+    assert_eq!(out, expected);
 }
 
 #[test]
-fn v05_status_detail_not_found_encode_matches() {
-    let (inp, wire) = load_pair("05_status_detail_not_found");
-    let mut out = [0u8; MTU_CAP];
-    let n = msg::encode_status_detail_not_found(
+fn vector_06_status_detail_found() {
+    let (j, expected) = load_vector("06_status_detail_found");
+    let ck = hex_to_arr32(j["cluster_key"].as_str().unwrap());
+    let peer_payload = hex_to_vec(j["peer_payload"].as_str().unwrap());
+    let peer_ipv4 = ipv4_str_to_bytes(j["peer_ipv4"].as_str().unwrap());
+    let mut out = vec![0u8; expected.len()];
+    msg::encode_status_detail_found(
         &mut out,
-        hex_arr::<8>(&inp["witness_sender_id"]),
-        inp["sequence"].as_u64().unwrap(),
-        inp["timestamp_ms"].as_i64().unwrap(),
-        inp["witness_uptime_ms"].as_u64().unwrap(),
-        &hex_arr::<8>(&inp["target_sender_id"]),
-        &hex_bytes(&inp["cluster_key"]),
-    ).unwrap();
-    assert_eq!(&out[..n], &wire[..]);
+        j["timestamp_ms"].as_i64().unwrap(),
+        j["witness_uptime_seconds"].as_u64().unwrap() as u32,
+        j["target_sender_id"].as_u64().unwrap() as u8,
+        &peer_ipv4,
+        j["peer_seen_ms_ago"].as_u64().unwrap() as u32,
+        &peer_payload,
+        &ck,
+    )
+    .unwrap();
+    assert_eq!(out, expected);
 }
 
 #[test]
-fn v06_unknown_source_encode_matches() {
-    let (inp, wire) = load_pair("06_unknown_source");
-    let mut out = [0u8; MTU_CAP];
-    let n = msg::encode_unknown_source(
+fn vector_07_status_detail_not_found() {
+    let (j, expected) = load_vector("07_status_detail_not_found");
+    let ck = hex_to_arr32(j["cluster_key"].as_str().unwrap());
+    let mut out = vec![0u8; expected.len()];
+    msg::encode_status_detail_not_found(
         &mut out,
-        hex_arr::<8>(&inp["witness_sender_id"]),
-        inp["sequence"].as_u64().unwrap(),
-        inp["timestamp_ms"].as_i64().unwrap(),
-    ).unwrap();
-    assert_eq!(&out[..n], &wire[..]);
+        j["timestamp_ms"].as_i64().unwrap(),
+        j["witness_uptime_seconds"].as_u64().unwrap() as u32,
+        j["target_sender_id"].as_u64().unwrap() as u8,
+        &ck,
+    )
+    .unwrap();
+    assert_eq!(out, expected);
 }
 
 #[test]
-fn v07_bootstrap_encode_matches() {
-    let (inp, wire) = load_pair("07_bootstrap");
-    let mut out = [0u8; MTU_CAP];
-    let n = msg::encode_bootstrap(
+fn vector_08_discover() {
+    let (j, expected) = load_vector("08_discover");
+    let mut out = vec![0u8; expected.len()];
+    msg::encode_discover(
         &mut out,
-        hex_arr::<8>(&inp["sender_id"]),
-        inp["sequence"].as_u64().unwrap(),
-        inp["timestamp_ms"].as_i64().unwrap(),
-        &hex_arr::<32>(&inp["witness_x25519_pub"]),
-        &hex_arr::<32>(&inp["eph_priv"]),
-        &hex_arr::<32>(&inp["cluster_key"]),
-        &hex_bytes(&inp["init_payload"]),
-    ).unwrap();
-    assert_eq!(&out[..n], &wire[..]);
+        j["sender_id"].as_u64().unwrap() as u8,
+        j["timestamp_ms"].as_i64().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(out, expected);
 }
 
 #[test]
-fn v08_bootstrap_ack_new_encode_matches() {
-    let (inp, wire) = load_pair("08_bootstrap_ack_new");
-    let mut out = [0u8; MTU_CAP];
-    let n = msg::encode_bootstrap_ack(
+fn vector_09_unknown_source() {
+    let (j, expected) = load_vector("09_unknown_source");
+    let pub_arr = hex_to_arr32(j["witness_pubkey"].as_str().unwrap());
+    let mut out = vec![0u8; expected.len()];
+    msg::encode_unknown_source(
         &mut out,
-        hex_arr::<8>(&inp["witness_sender_id"]),
-        inp["sequence"].as_u64().unwrap(),
-        inp["timestamp_ms"].as_i64().unwrap(),
-        inp["status"].as_u64().unwrap() as u8,
-        inp["witness_uptime_ms"].as_u64().unwrap(),
-        &hex_bytes(&inp["cluster_key"]),
-    ).unwrap();
-    assert_eq!(&out[..n], &wire[..]);
+        j["timestamp_ms"].as_i64().unwrap(),
+        &pub_arr,
+    )
+    .unwrap();
+    assert_eq!(out, expected);
 }
 
 #[test]
-fn v09_bootstrap_ack_rebootstrap_encode_matches() {
-    let (inp, wire) = load_pair("09_bootstrap_ack_rebootstrap");
-    let mut out = [0u8; MTU_CAP];
-    let n = msg::encode_bootstrap_ack(
+fn vector_10_bootstrap() {
+    let (j, expected) = load_vector("10_bootstrap");
+    let cluster_key = hex_to_arr32(j["cluster_key"].as_str().unwrap());
+    let witness_pubkey = hex_to_arr32(j["witness_pubkey"].as_str().unwrap());
+    let eph_priv = hex_to_arr32(j["eph_priv"].as_str().unwrap());
+    let mut out = vec![0u8; expected.len()];
+    msg::encode_bootstrap(
         &mut out,
-        hex_arr::<8>(&inp["witness_sender_id"]),
-        inp["sequence"].as_u64().unwrap(),
-        inp["timestamp_ms"].as_i64().unwrap(),
-        inp["status"].as_u64().unwrap() as u8,
-        inp["witness_uptime_ms"].as_u64().unwrap(),
-        &hex_bytes(&inp["cluster_key"]),
-    ).unwrap();
-    assert_eq!(&out[..n], &wire[..]);
-}
+        j["sender_id"].as_u64().unwrap() as u8,
+        j["timestamp_ms"].as_i64().unwrap(),
+        &cluster_key,
+        &witness_pubkey,
+        &eph_priv,
+    )
+    .unwrap();
+    assert_eq!(out, expected);
 
-// ─── Decoders must round-trip the same wire bytes ───────────────────────────
-
-#[test]
-fn v01_heartbeat_list_query_decode_matches() {
-    let (inp, wire) = load_pair("01_heartbeat_list_query");
-    let view = msg::decode_heartbeat(&wire, &hex_bytes(&inp["cluster_key"])).unwrap();
-    assert_eq!(view.header.sender_id, hex_arr::<8>(&inp["sender_id"]));
-    assert_eq!(view.query_target_id, hex_arr::<8>(&inp["query_target_id"]));
-    assert_eq!(view.own_payload, &hex_bytes(&inp["own_payload"])[..]);
+    // Decode requires witness_priv (deterministic seed used in the generator).
+    let witness_priv = [0xAAu8; 32];
+    let mut buf = expected.clone();
+    let (_hdr, decoded_ck) = msg::decode_bootstrap(&mut buf, &witness_priv).unwrap();
+    assert_eq!(decoded_ck, cluster_key);
 }
 
 #[test]
-fn v07_bootstrap_decode_matches() {
-    let (inp, wire) = load_pair("07_bootstrap");
-    let d = msg::decode_bootstrap(&wire, &hex_arr::<32>(&inp["witness_x25519_priv"])).unwrap();
-    assert_eq!(d.plaintext.cluster_key, hex_arr::<32>(&inp["cluster_key"]));
-    let expected_init = hex_bytes(&inp["init_payload"]);
-    assert_eq!(&d.plaintext.init_payload[..d.plaintext.init_payload_len],
-               &expected_init[..]);
+fn vector_11_bootstrap_ack_new() {
+    let (j, expected) = load_vector("11_bootstrap_ack_new");
+    let ck = hex_to_arr32(j["cluster_key"].as_str().unwrap());
+    let mut out = vec![0u8; expected.len()];
+    msg::encode_bootstrap_ack(
+        &mut out,
+        j["timestamp_ms"].as_i64().unwrap(),
+        j["status"].as_u64().unwrap() as u8,
+        j["witness_uptime_seconds"].as_u64().unwrap() as u32,
+        &ck,
+    )
+    .unwrap();
+    assert_eq!(out, expected);
 }
 
 #[test]
-fn v03_status_list_decode_matches() {
-    let (inp, wire) = load_pair("03_status_list_two_nodes");
-    let view = msg::decode_status_list(&wire, &hex_bytes(&inp["cluster_key"])).unwrap();
-    assert_eq!(view.witness_uptime_ms, inp["witness_uptime_ms"].as_u64().unwrap());
-    let expected = inp["entries"].as_array().unwrap();
-    assert_eq!(view.num_entries as usize, expected.len());
-    for (i, e) in expected.iter().enumerate() {
-        let got = view.entry(i).unwrap();
-        assert_eq!(got.peer_sender_id, hex_arr::<8>(&e["peer_sender_id"]));
-        assert_eq!(got.peer_ipv4, parse_ipv4(&e["peer_ipv4"]));
-        assert_eq!(got.last_seen_seconds as u64, e["last_seen_seconds"].as_u64().unwrap());
-    }
+fn vector_12_bootstrap_ack_rebootstrap() {
+    let (j, expected) = load_vector("12_bootstrap_ack_rebootstrap");
+    let ck = hex_to_arr32(j["cluster_key"].as_str().unwrap());
+    let mut out = vec![0u8; expected.len()];
+    msg::encode_bootstrap_ack(
+        &mut out,
+        j["timestamp_ms"].as_i64().unwrap(),
+        j["status"].as_u64().unwrap() as u8,
+        j["witness_uptime_seconds"].as_u64().unwrap() as u32,
+        &ck,
+    )
+    .unwrap();
+    assert_eq!(out, expected);
+}
+
+// ── nonce derivation unit tests ──────────────────────────────────────────
+
+#[test]
+fn nonce_derivation_layout() {
+    let n = derive_nonce(0x01, 0x0102030405060708);
+    assert_eq!(n[0], 0x01);
+    assert_eq!(&n[1..4], &[0u8, 0u8, 0u8]);
+    assert_eq!(&n[4..12], &0x0102030405060708i64.to_be_bytes());
 }
 
 #[test]
-fn v04_status_detail_found_decode_matches() {
-    let (inp, wire) = load_pair("04_status_detail_found");
-    let view = msg::decode_status_detail(&wire, &hex_bytes(&inp["cluster_key"])).unwrap();
-    match view {
-        msg::StatusDetailView::Found { peer_payload, peer_ipv4, target_sender_id, .. } => {
-            assert_eq!(peer_payload, &hex_bytes(&inp["peer_payload"])[..]);
-            assert_eq!(peer_ipv4, parse_ipv4(&inp["peer_ipv4"]));
-            assert_eq!(target_sender_id, hex_arr::<8>(&inp["target_sender_id"]));
-        }
-        _ => panic!("expected Found"),
-    }
+fn nonce_distinguishes_witness_vs_node() {
+    let nn = derive_nonce(0x01, 1234);
+    let nw = derive_nonce(0xFF, 1234);
+    assert_ne!(nn, nw);
+}
+
+#[test]
+fn nonce_distinguishes_consecutive_packets() {
+    let n1 = derive_nonce(0x01, 1234);
+    let n2 = derive_nonce(0x01, 1235);
+    assert_ne!(n1, n2);
 }

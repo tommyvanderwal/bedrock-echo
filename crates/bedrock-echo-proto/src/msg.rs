@@ -1,503 +1,630 @@
-//! Message encode/decode for all 6 msg_types.
+//! Message encode/decode for all 7 msg_types (Bedrock Echo v1).
 //!
-//! Encoders write into caller-supplied buffers (no alloc). Decoders return
-//! views/copies into fixed-size structs.
+//! Encoders write into caller-supplied buffers (no_std-friendly).
+//! Decoders verify AEAD/structure and return parsed views.
+//!
+//! See PROTOCOL.md §5 for byte layouts.
 
 use crate::constants::*;
 use crate::crypto;
-use crate::header::Header;
+use crate::header::{derive_nonce, Header};
 use crate::{Error, Result};
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
+// ── shared helpers ────────────────────────────────────────────────────────
 
 #[inline]
 fn write_u32(buf: &mut [u8], off: usize, v: u32) {
     buf[off..off + 4].copy_from_slice(&v.to_be_bytes());
 }
 #[inline]
-fn write_u64(buf: &mut [u8], off: usize, v: u64) {
-    buf[off..off + 8].copy_from_slice(&v.to_be_bytes());
-}
-#[inline]
 fn read_u32(buf: &[u8], off: usize) -> u32 {
     u32::from_be_bytes(buf[off..off + 4].try_into().unwrap())
 }
+
 #[inline]
-fn read_u64(buf: &[u8], off: usize) -> u64 {
-    u64::from_be_bytes(buf[off..off + 8].try_into().unwrap())
-}
-
-fn finalize_with_hmac(buf: &mut [u8], body_len: usize, cluster_key: &[u8]) {
-    // body_len is the length of (header + payload); HMAC appended to buf[body_len..body_len+32].
-    let tag = crypto::hmac_sha256(cluster_key, &buf[..body_len]);
-    buf[body_len..body_len + HMAC_LEN].copy_from_slice(&tag);
-}
-
-fn verify_and_strip_hmac<'a>(
-    buf: &'a [u8],
-    cluster_key: &[u8],
-) -> Result<&'a [u8]> {
-    if buf.len() < HMAC_LEN { return Err(Error::TooShort); }
-    let body_len = buf.len() - HMAC_LEN;
-    let (body, tag) = buf.split_at(body_len);
-    if !crypto::hmac_verify(cluster_key, body, tag) {
-        return Err(Error::AuthFailed);
+fn validate_node_sender_id(sender_id: u8) -> Result<()> {
+    if sender_id > NODE_SENDER_ID_MAX {
+        Err(Error::BadSenderId)
+    } else {
+        Ok(())
     }
-    Ok(body)
 }
 
-// ─── HEARTBEAT (0x01) ──────────────────────────────────────────────────────
+#[inline]
+fn validate_witness_sender_id(sender_id: u8) -> Result<()> {
+    if sender_id != WITNESS_SENDER_ID {
+        Err(Error::BadSenderId)
+    } else {
+        Ok(())
+    }
+}
 
-/// Encode a HEARTBEAT into `out`. Returns total bytes written.
-/// `out.len()` must be at least `HEADER_LEN + 8 + own_payload.len() + HMAC_LEN`.
+#[inline]
+fn validate_payload_blocks(n_blocks: usize) -> Result<()> {
+    if n_blocks > PAYLOAD_MAX_BLOCKS {
+        Err(Error::BadField)
+    } else {
+        Ok(())
+    }
+}
+
+#[inline]
+fn validate_payload_size(payload: &[u8]) -> Result<()> {
+    if payload.len() % PAYLOAD_BLOCK_SIZE != 0 {
+        return Err(Error::BadPayloadSize);
+    }
+    if payload.len() > PAYLOAD_MAX_BYTES {
+        return Err(Error::BadPayloadSize);
+    }
+    Ok(())
+}
+
+// ── HEARTBEAT (0x01) — node → witness ─────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Heartbeat<'a> {
+    pub header: Header,
+    pub query_target_id: u8,
+    pub own_payload: &'a [u8], // length is multiple of 32, max 1152
+}
+
+/// Encode a HEARTBEAT. Returns total bytes written.
 pub fn encode_heartbeat(
     out: &mut [u8],
-    sender_id: [u8; 8],
-    sequence: u64,
+    sender_id: u8,
     timestamp_ms: i64,
-    query_target_id: &[u8; 8],
+    query_target_id: u8,
     own_payload: &[u8],
-    cluster_key: &[u8],
+    cluster_key: &[u8; CLUSTER_KEY_LEN],
 ) -> Result<usize> {
-    if sender_id == [0u8; 8] { return Err(Error::ZeroSenderId); }
-    if own_payload.len() > NODE_PAYLOAD_MAX { return Err(Error::BadPayloadLen); }
-    let payload_len = 8 + own_payload.len();
-    let total = HEADER_LEN + payload_len + HMAC_LEN;
-    if total > MTU_CAP { return Err(Error::OverMtu); }
-    if out.len() < total { return Err(Error::BadLength); }
+    validate_node_sender_id(sender_id)?;
+    validate_payload_size(own_payload)?;
+    let n_blocks = own_payload.len() / PAYLOAD_BLOCK_SIZE;
+    validate_payload_blocks(n_blocks)?;
 
-    let hdr = Header {
-        msg_type: MSG_HEARTBEAT, reserved: 0, sender_id,
-        sequence, timestamp_ms,
-        payload_len: payload_len as u16,
-    };
+    let pt_len = 2 + own_payload.len();
+    let total = HEADER_LEN + pt_len + AEAD_TAG_LEN;
+    if total > MTU_CAP {
+        return Err(Error::OverMtu);
+    }
+    if out.len() < total {
+        return Err(Error::BadLength);
+    }
+
+    let hdr = Header { msg_type: MSG_HEARTBEAT, sender_id, timestamp_ms };
     hdr.pack(&mut out[..HEADER_LEN]);
-    out[HEADER_LEN..HEADER_LEN + 8].copy_from_slice(query_target_id);
-    out[HEADER_LEN + 8..HEADER_LEN + 8 + own_payload.len()].copy_from_slice(own_payload);
-    let body_len = HEADER_LEN + payload_len;
-    finalize_with_hmac(out, body_len, cluster_key);
+
+    // Build plaintext in a stack scratch buffer.
+    let mut pt = [0u8; 2 + PAYLOAD_MAX_BYTES];
+    pt[0] = query_target_id;
+    pt[1] = n_blocks as u8;
+    pt[2..2 + own_payload.len()].copy_from_slice(own_payload);
+
+    let aad = &out[..HEADER_LEN];
+    // We can't borrow out twice; use a local buffer for the AEAD output.
+    let mut ct_buf = [0u8; PAYLOAD_MAX_BYTES + 2 + AEAD_TAG_LEN];
+    let nonce = derive_nonce(sender_id, timestamp_ms);
+    let n = crypto::aead_encrypt(cluster_key, &nonce, aad, &pt[..pt_len], &mut ct_buf)?;
+    out[HEADER_LEN..HEADER_LEN + n].copy_from_slice(&ct_buf[..n]);
     Ok(total)
 }
 
-pub struct HeartbeatView<'a> {
-    pub header: Header,
-    pub query_target_id: [u8; 8],
-    pub own_payload: &'a [u8],
-}
+/// Decode a HEARTBEAT. The input buffer is consumed for in-place AEAD decrypt.
+/// Returns `(header, query_target_id, own_payload_len)`. The plaintext payload
+/// is left at `buf[HEADER_LEN + 2 .. HEADER_LEN + 2 + own_payload_len]`.
+pub fn decode_heartbeat_into<'a>(
+    buf: &'a mut [u8],
+    cluster_key: &[u8; CLUSTER_KEY_LEN],
+) -> Result<(Header, u8, &'a [u8])> {
+    if buf.len() < HEADER_LEN + 2 + AEAD_TAG_LEN {
+        return Err(Error::TooShort);
+    }
+    let hdr = Header::unpack(buf)?;
+    if hdr.msg_type != MSG_HEARTBEAT {
+        return Err(Error::BadMsgType);
+    }
 
-pub fn decode_heartbeat<'a>(buf: &'a [u8], cluster_key: &[u8]) -> Result<HeartbeatView<'a>> {
-    if buf.len() > MTU_CAP { return Err(Error::OverMtu); }
-    let body = verify_and_strip_hmac(buf, cluster_key)?;
-    let hdr = Header::unpack(body)?;
-    if hdr.msg_type != MSG_HEARTBEAT { return Err(Error::BadMsgType); }
-    if body.len() != HEADER_LEN + hdr.payload_len as usize {
+    let nonce = derive_nonce(hdr.sender_id, hdr.timestamp_ms);
+    let (header_part, ct_part) = buf.split_at_mut(HEADER_LEN);
+    let pt_len = crypto::aead_decrypt(cluster_key, &nonce, header_part, ct_part)?;
+    if pt_len < 2 {
         return Err(Error::BadLength);
     }
-    if (hdr.payload_len as usize) < 8
-        || (hdr.payload_len as usize) > 8 + NODE_PAYLOAD_MAX {
-        return Err(Error::BadPayloadLen);
+    let query_target_id = ct_part[0];
+    let n_blocks = ct_part[1] as usize;
+    validate_payload_blocks(n_blocks)?;
+    let expected = 2 + n_blocks * PAYLOAD_BLOCK_SIZE;
+    if pt_len != expected {
+        return Err(Error::BadLength);
     }
-    if hdr.sender_id == [0u8; 8] { return Err(Error::ZeroSenderId); }
-    let mut q = [0u8; 8];
-    q.copy_from_slice(&body[HEADER_LEN..HEADER_LEN + 8]);
-    let own_payload = &body[HEADER_LEN + 8..HEADER_LEN + hdr.payload_len as usize];
-    Ok(HeartbeatView { header: hdr, query_target_id: q, own_payload })
+    Ok((hdr, query_target_id, &ct_part[2..2 + n_blocks * PAYLOAD_BLOCK_SIZE]))
 }
 
-// ─── STATUS_LIST (0x02) ────────────────────────────────────────────────────
+// ── STATUS_LIST (0x02) — witness → node ──────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ListEntry {
-    pub peer_sender_id: [u8; 8],
-    pub peer_ipv4: [u8; 4],
-    pub last_seen_seconds: u32,
+    pub peer_sender_id: u8,
+    pub last_seen_ms: u32,
 }
 
-/// Write a STATUS_LIST packet. Entries come from the caller's storage.
+/// Encode a STATUS_LIST. Returns total bytes written.
 pub fn encode_status_list(
     out: &mut [u8],
-    sender_id: [u8; 8],
-    sequence: u64,
     timestamp_ms: i64,
-    witness_uptime_ms: u64,
+    witness_uptime_seconds: u32,
     entries: &[ListEntry],
-    cluster_key: &[u8],
+    cluster_key: &[u8; CLUSTER_KEY_LEN],
 ) -> Result<usize> {
-    if entries.len() > LIST_MAX_ENTRIES { return Err(Error::BadPayloadLen); }
-    let payload_len = 10 + entries.len() * LIST_ENTRY_LEN;
-    let total = HEADER_LEN + payload_len + HMAC_LEN;
-    if total > MTU_CAP { return Err(Error::OverMtu); }
-    if out.len() < total { return Err(Error::BadLength); }
+    if entries.len() > LIST_MAX_ENTRIES {
+        return Err(Error::BadField);
+    }
+    let pt_len = 5 + entries.len() * LIST_ENTRY_LEN;
+    let total = HEADER_LEN + pt_len + AEAD_TAG_LEN;
+    if total > MTU_CAP {
+        return Err(Error::OverMtu);
+    }
+    if out.len() < total {
+        return Err(Error::BadLength);
+    }
 
     let hdr = Header {
-        msg_type: MSG_STATUS_LIST, reserved: 0, sender_id,
-        sequence, timestamp_ms,
-        payload_len: payload_len as u16,
+        msg_type: MSG_STATUS_LIST,
+        sender_id: WITNESS_SENDER_ID,
+        timestamp_ms,
     };
     hdr.pack(&mut out[..HEADER_LEN]);
-    let p = HEADER_LEN;
-    write_u64(out, p, witness_uptime_ms);
-    out[p + 8] = entries.len() as u8;
-    out[p + 9] = 0;
-    for (i, e) in entries.iter().enumerate() {
-        let off = p + 10 + i * LIST_ENTRY_LEN;
-        out[off..off + 8].copy_from_slice(&e.peer_sender_id);
-        out[off + 8..off + 12].copy_from_slice(&e.peer_ipv4);
-        write_u32(out, off + 12, e.last_seen_seconds);
+
+    let mut pt = [0u8; 5 + LIST_MAX_ENTRIES * LIST_ENTRY_LEN];
+    write_u32(&mut pt, 0, witness_uptime_seconds);
+    pt[4] = entries.len() as u8;
+    let mut off = 5;
+    for e in entries.iter() {
+        pt[off] = e.peer_sender_id;
+        write_u32(&mut pt, off + 1, e.last_seen_ms);
+        off += LIST_ENTRY_LEN;
     }
-    finalize_with_hmac(out, HEADER_LEN + payload_len, cluster_key);
+
+    let aad = &out[..HEADER_LEN];
+    let mut ct_buf = [0u8; 5 + LIST_MAX_ENTRIES * LIST_ENTRY_LEN + AEAD_TAG_LEN];
+    let nonce = derive_nonce(WITNESS_SENDER_ID, timestamp_ms);
+    let n = crypto::aead_encrypt(cluster_key, &nonce, aad, &pt[..pt_len], &mut ct_buf)?;
+    out[HEADER_LEN..HEADER_LEN + n].copy_from_slice(&ct_buf[..n]);
     Ok(total)
 }
 
-pub struct StatusListView<'a> {
+pub struct StatusListReader<'a> {
     pub header: Header,
-    pub witness_uptime_ms: u64,
-    pub raw_entries: &'a [u8],
+    pub witness_uptime_seconds: u32,
     pub num_entries: u8,
+    pub entries_bytes: &'a [u8], // 5 * num_entries
 }
 
-impl<'a> StatusListView<'a> {
+impl<'a> StatusListReader<'a> {
     pub fn entry(&self, i: usize) -> Option<ListEntry> {
-        if i >= self.num_entries as usize { return None; }
-        let off = i * LIST_ENTRY_LEN;
-        let mut peer_sender_id = [0u8; 8];
-        let mut peer_ipv4 = [0u8; 4];
-        peer_sender_id.copy_from_slice(&self.raw_entries[off..off + 8]);
-        peer_ipv4.copy_from_slice(&self.raw_entries[off + 8..off + 12]);
-        let last_seen_seconds = read_u32(self.raw_entries, off + 12);
-        Some(ListEntry { peer_sender_id, peer_ipv4, last_seen_seconds })
+        if i >= self.num_entries as usize {
+            return None;
+        }
+        let base = i * LIST_ENTRY_LEN;
+        Some(ListEntry {
+            peer_sender_id: self.entries_bytes[base],
+            last_seen_ms: read_u32(self.entries_bytes, base + 1),
+        })
     }
 }
 
-pub fn decode_status_list<'a>(buf: &'a [u8], cluster_key: &[u8]) -> Result<StatusListView<'a>> {
-    if buf.len() > MTU_CAP { return Err(Error::OverMtu); }
-    let body = verify_and_strip_hmac(buf, cluster_key)?;
-    let hdr = Header::unpack(body)?;
-    if hdr.msg_type != MSG_STATUS_LIST { return Err(Error::BadMsgType); }
-    if body.len() != HEADER_LEN + hdr.payload_len as usize {
+pub fn decode_status_list_into<'a>(
+    buf: &'a mut [u8],
+    cluster_key: &[u8; CLUSTER_KEY_LEN],
+) -> Result<StatusListReader<'a>> {
+    if buf.len() < HEADER_LEN + 5 + AEAD_TAG_LEN {
+        return Err(Error::TooShort);
+    }
+    let hdr = Header::unpack(buf)?;
+    if hdr.msg_type != MSG_STATUS_LIST {
+        return Err(Error::BadMsgType);
+    }
+    validate_witness_sender_id(hdr.sender_id)?;
+
+    let nonce = derive_nonce(hdr.sender_id, hdr.timestamp_ms);
+    let (header_part, ct_part) = buf.split_at_mut(HEADER_LEN);
+    let pt_len = crypto::aead_decrypt(cluster_key, &nonce, header_part, ct_part)?;
+    if pt_len < 5 {
         return Err(Error::BadLength);
     }
-    let pl = &body[HEADER_LEN..];
-    if pl.len() < 10 { return Err(Error::BadPayloadLen); }
-    let witness_uptime_ms = read_u64(pl, 0);
-    let n = pl[8];
-    if pl[9] != 0 { return Err(Error::BadField); }
-    let expected = 10usize + n as usize * LIST_ENTRY_LEN;
-    if pl.len() != expected { return Err(Error::BadLength); }
-    if n as usize > LIST_MAX_ENTRIES { return Err(Error::BadField); }
-    Ok(StatusListView {
+    let witness_uptime_seconds = read_u32(ct_part, 0);
+    let num_entries = ct_part[4];
+    if num_entries as usize > LIST_MAX_ENTRIES {
+        return Err(Error::BadField);
+    }
+    let expected = 5 + (num_entries as usize) * LIST_ENTRY_LEN;
+    if pt_len != expected {
+        return Err(Error::BadLength);
+    }
+    Ok(StatusListReader {
         header: hdr,
-        witness_uptime_ms,
-        num_entries: n,
-        raw_entries: &pl[10..],
+        witness_uptime_seconds,
+        num_entries,
+        entries_bytes: &ct_part[5..5 + (num_entries as usize) * LIST_ENTRY_LEN],
     })
 }
 
-// ─── STATUS_DETAIL (0x03) ──────────────────────────────────────────────────
+// ── STATUS_DETAIL (0x03) — witness → node ────────────────────────────────
 
-pub struct StatusDetailFound<'a> {
-    pub target_sender_id: [u8; 8],
-    pub peer_ipv4: [u8; 4],
-    pub last_seen_seconds: u32,
-    pub peer_payload: &'a [u8],
-}
-
+/// Encode a STATUS_DETAIL "found" reply.
 pub fn encode_status_detail_found(
     out: &mut [u8],
-    sender_id: [u8; 8],
-    sequence: u64,
     timestamp_ms: i64,
-    witness_uptime_ms: u64,
-    target_sender_id: &[u8; 8],
+    witness_uptime_seconds: u32,
+    target_sender_id: u8,
     peer_ipv4: &[u8; 4],
-    last_seen_seconds: u32,
+    peer_seen_ms_ago: u32,
     peer_payload: &[u8],
-    cluster_key: &[u8],
+    cluster_key: &[u8; CLUSTER_KEY_LEN],
 ) -> Result<usize> {
-    if peer_payload.len() > NODE_PAYLOAD_MAX { return Err(Error::BadPayloadLen); }
-    let payload_len = 27 + peer_payload.len();
-    let total = HEADER_LEN + payload_len + HMAC_LEN;
-    if total > MTU_CAP { return Err(Error::OverMtu); }
-    if out.len() < total { return Err(Error::BadLength); }
+    validate_payload_size(peer_payload)?;
+    let n_blocks = peer_payload.len() / PAYLOAD_BLOCK_SIZE;
+    validate_payload_blocks(n_blocks)?;
+
+    let pt_len = 6 + 4 + 4 + peer_payload.len(); // uptime+target+sb+ipv4+seen+payload
+    let total = HEADER_LEN + pt_len + AEAD_TAG_LEN;
+    if total > MTU_CAP {
+        return Err(Error::OverMtu);
+    }
+    if out.len() < total {
+        return Err(Error::BadLength);
+    }
+
     let hdr = Header {
-        msg_type: MSG_STATUS_DETAIL, reserved: 0, sender_id,
-        sequence, timestamp_ms, payload_len: payload_len as u16,
+        msg_type: MSG_STATUS_DETAIL,
+        sender_id: WITNESS_SENDER_ID,
+        timestamp_ms,
     };
     hdr.pack(&mut out[..HEADER_LEN]);
-    let p = HEADER_LEN;
-    write_u64(out, p, witness_uptime_ms);
-    out[p + 8..p + 16].copy_from_slice(target_sender_id);
-    out[p + 16] = 0x00;
-    out[p + 17] = 0;
-    out[p + 18..p + 22].copy_from_slice(peer_ipv4);
-    write_u32(out, p + 22, last_seen_seconds);
-    out[p + 26] = peer_payload.len() as u8;
-    out[p + 27..p + 27 + peer_payload.len()].copy_from_slice(peer_payload);
-    finalize_with_hmac(out, HEADER_LEN + payload_len, cluster_key);
+
+    let mut pt = [0u8; 6 + 4 + 4 + PAYLOAD_MAX_BYTES];
+    write_u32(&mut pt, 0, witness_uptime_seconds);
+    pt[4] = target_sender_id;
+    pt[5] = n_blocks as u8; // status bit 7 = 0 (found), bits 0-5 = blocks
+    pt[6..10].copy_from_slice(peer_ipv4);
+    write_u32(&mut pt, 10, peer_seen_ms_ago);
+    pt[14..14 + peer_payload.len()].copy_from_slice(peer_payload);
+
+    let aad = &out[..HEADER_LEN];
+    let mut ct_buf = [0u8; 6 + 4 + 4 + PAYLOAD_MAX_BYTES + AEAD_TAG_LEN];
+    let nonce = derive_nonce(WITNESS_SENDER_ID, timestamp_ms);
+    let n = crypto::aead_encrypt(cluster_key, &nonce, aad, &pt[..pt_len], &mut ct_buf)?;
+    out[HEADER_LEN..HEADER_LEN + n].copy_from_slice(&ct_buf[..n]);
     Ok(total)
 }
 
+/// Encode a STATUS_DETAIL "not found" reply.
 pub fn encode_status_detail_not_found(
     out: &mut [u8],
-    sender_id: [u8; 8],
-    sequence: u64,
     timestamp_ms: i64,
-    witness_uptime_ms: u64,
-    target_sender_id: &[u8; 8],
-    cluster_key: &[u8],
+    witness_uptime_seconds: u32,
+    target_sender_id: u8,
+    cluster_key: &[u8; CLUSTER_KEY_LEN],
 ) -> Result<usize> {
-    let payload_len = 18usize;
-    let total = HEADER_LEN + payload_len + HMAC_LEN;
-    if out.len() < total { return Err(Error::BadLength); }
+    let pt_len = 6;
+    let total = HEADER_LEN + pt_len + AEAD_TAG_LEN; // 36
+    if out.len() < total {
+        return Err(Error::BadLength);
+    }
     let hdr = Header {
-        msg_type: MSG_STATUS_DETAIL, reserved: 0, sender_id,
-        sequence, timestamp_ms, payload_len: payload_len as u16,
+        msg_type: MSG_STATUS_DETAIL,
+        sender_id: WITNESS_SENDER_ID,
+        timestamp_ms,
     };
     hdr.pack(&mut out[..HEADER_LEN]);
-    let p = HEADER_LEN;
-    write_u64(out, p, witness_uptime_ms);
-    out[p + 8..p + 16].copy_from_slice(target_sender_id);
-    out[p + 16] = 0x01;
-    out[p + 17] = 0;
-    finalize_with_hmac(out, HEADER_LEN + payload_len, cluster_key);
+
+    let mut pt = [0u8; 6];
+    write_u32(&mut pt, 0, witness_uptime_seconds);
+    pt[4] = target_sender_id;
+    pt[5] = STATUS_DETAIL_NOT_FOUND_BIT; // bit 7 = 1, bits 0-6 = 0 (v1)
+
+    let aad = &out[..HEADER_LEN];
+    let mut ct_buf = [0u8; 6 + AEAD_TAG_LEN];
+    let nonce = derive_nonce(WITNESS_SENDER_ID, timestamp_ms);
+    let n = crypto::aead_encrypt(cluster_key, &nonce, aad, &pt, &mut ct_buf)?;
+    out[HEADER_LEN..HEADER_LEN + n].copy_from_slice(&ct_buf[..n]);
     Ok(total)
 }
 
 #[derive(Debug)]
-pub enum StatusDetailView<'a> {
-    Found {
-        header: Header,
-        witness_uptime_ms: u64,
-        target_sender_id: [u8; 8],
-        peer_ipv4: [u8; 4],
-        last_seen_seconds: u32,
-        peer_payload: &'a [u8],
-    },
-    NotFound {
-        header: Header,
-        witness_uptime_ms: u64,
-        target_sender_id: [u8; 8],
-    },
-}
-
-pub fn decode_status_detail<'a>(buf: &'a [u8], cluster_key: &[u8]) -> Result<StatusDetailView<'a>> {
-    if buf.len() > MTU_CAP { return Err(Error::OverMtu); }
-    let body = verify_and_strip_hmac(buf, cluster_key)?;
-    let hdr = Header::unpack(body)?;
-    if hdr.msg_type != MSG_STATUS_DETAIL { return Err(Error::BadMsgType); }
-    if body.len() != HEADER_LEN + hdr.payload_len as usize {
-        return Err(Error::BadLength);
-    }
-    let pl = &body[HEADER_LEN..];
-    if pl.len() < 18 { return Err(Error::BadPayloadLen); }
-    let witness_uptime_ms = read_u64(pl, 0);
-    let mut target = [0u8; 8];
-    target.copy_from_slice(&pl[8..16]);
-    let status = pl[16];
-    if pl[17] != 0 { return Err(Error::BadField); }
-    match status {
-        0x00 => {
-            if pl.len() < 27 { return Err(Error::BadPayloadLen); }
-            let mut ip = [0u8; 4];
-            ip.copy_from_slice(&pl[18..22]);
-            let ls = read_u32(pl, 22);
-            let pl_len = pl[26] as usize;
-            if pl.len() != 27 + pl_len { return Err(Error::BadLength); }
-            Ok(StatusDetailView::Found {
-                header: hdr,
-                witness_uptime_ms,
-                target_sender_id: target,
-                peer_ipv4: ip,
-                last_seen_seconds: ls,
-                peer_payload: &pl[27..27 + pl_len],
-            })
-        }
-        0x01 => {
-            if pl.len() != 18 { return Err(Error::BadLength); }
-            Ok(StatusDetailView::NotFound {
-                header: hdr,
-                witness_uptime_ms,
-                target_sender_id: target,
-            })
-        }
-        _ => Err(Error::BadField),
-    }
-}
-
-// ─── UNKNOWN_SOURCE (0x10) ─────────────────────────────────────────────────
-
-pub fn encode_unknown_source(
-    out: &mut [u8],
-    sender_id: [u8; 8],
-    sequence: u64,
-    timestamp_ms: i64,
-) -> Result<usize> {
-    if out.len() < HEADER_LEN { return Err(Error::BadLength); }
-    let hdr = Header {
-        msg_type: MSG_UNKNOWN_SOURCE, reserved: 0, sender_id,
-        sequence, timestamp_ms, payload_len: 0,
-    };
-    hdr.pack(&mut out[..HEADER_LEN]);
-    Ok(HEADER_LEN)
-}
-
-pub fn decode_unknown_source(buf: &[u8]) -> Result<Header> {
-    if buf.len() != HEADER_LEN { return Err(Error::BadLength); }
-    let hdr = Header::unpack(buf)?;
-    if hdr.msg_type != MSG_UNKNOWN_SOURCE { return Err(Error::BadMsgType); }
-    if hdr.payload_len != 0 { return Err(Error::BadPayloadLen); }
-    Ok(hdr)
-}
-
-// ─── BOOTSTRAP (0x20) ──────────────────────────────────────────────────────
-
-pub fn encode_bootstrap(
-    out: &mut [u8],
-    sender_id: [u8; 8],
-    sequence: u64,
-    timestamp_ms: i64,
-    witness_pub: &[u8; 32],
-    eph_priv: &[u8; 32],
-    cluster_key: &[u8; 32],
-    init_payload: &[u8],
-) -> Result<usize> {
-    if sender_id == [0u8; 8] { return Err(Error::ZeroSenderId); }
-    if init_payload.len() > BOOTSTRAP_INIT_PAYLOAD_MAX { return Err(Error::BadPayloadLen); }
-    let pt_len = 32 + init_payload.len();
-    let payload_len = 32 + pt_len + AEAD_TAG_LEN;
-    let total = HEADER_LEN + payload_len;
-    if total > MTU_CAP { return Err(Error::OverMtu); }
-    if out.len() < total { return Err(Error::BadLength); }
-
-    let hdr = Header {
-        msg_type: MSG_BOOTSTRAP, reserved: 0, sender_id,
-        sequence, timestamp_ms, payload_len: payload_len as u16,
-    };
-    hdr.pack(&mut out[..HEADER_LEN]);
-
-    // Ephemeral public at payload[0..32]
-    let eph_pub = crypto::x25519_pub_from_priv(eph_priv);
-    out[HEADER_LEN..HEADER_LEN + 32].copy_from_slice(&eph_pub);
-
-    // Build plaintext, then encrypt
-    // Assemble in the output buffer at [HEADER_LEN+32..HEADER_LEN+32+pt_len+tag]
-    let mut plaintext = [0u8; 32 + BOOTSTRAP_INIT_PAYLOAD_MAX];
-    plaintext[0..32].copy_from_slice(cluster_key);
-    plaintext[32..32 + init_payload.len()].copy_from_slice(init_payload);
-    let pt = &plaintext[..pt_len];
-
-    let shared = crypto::x25519_shared(eph_priv, witness_pub);
-    let mut derived = [0u8; 32];
-    crypto::hkdf_sha256(&shared, &mut derived);
-    let aad = &out[..HEADER_LEN];
-    // Encrypt into out[HEADER_LEN+32..]
-    // We need to construct a slice we can mutate; use a fresh buffer then copy.
-    let mut ct_buf = [0u8; (32 + BOOTSTRAP_INIT_PAYLOAD_MAX) + AEAD_TAG_LEN];
-    crypto::aead_encrypt(&derived, aad, pt, &mut ct_buf[..pt_len + AEAD_TAG_LEN])?;
-    out[HEADER_LEN + 32..HEADER_LEN + 32 + pt_len + AEAD_TAG_LEN]
-        .copy_from_slice(&ct_buf[..pt_len + AEAD_TAG_LEN]);
-
-    Ok(total)
-}
-
-pub struct BootstrapPlaintext {
-    pub cluster_key: [u8; 32],
-    pub init_payload_len: usize,
-    pub init_payload: [u8; BOOTSTRAP_INIT_PAYLOAD_MAX],
-}
-
-pub struct BootstrapDecoded {
+pub struct StatusDetailReader<'a> {
     pub header: Header,
-    pub plaintext: BootstrapPlaintext,
+    pub witness_uptime_seconds: u32,
+    pub target_sender_id: u8,
+    pub found: bool,
+    pub peer_ipv4: [u8; 4],
+    pub peer_seen_ms_ago: u32,
+    pub peer_payload: &'a [u8],
 }
 
-pub fn decode_bootstrap(buf: &[u8], witness_priv: &[u8; 32]) -> Result<BootstrapDecoded> {
-    if buf.len() > MTU_CAP { return Err(Error::OverMtu); }
+pub fn decode_status_detail_into<'a>(
+    buf: &'a mut [u8],
+    cluster_key: &[u8; CLUSTER_KEY_LEN],
+) -> Result<StatusDetailReader<'a>> {
+    if buf.len() < HEADER_LEN + 6 + AEAD_TAG_LEN {
+        return Err(Error::TooShort);
+    }
     let hdr = Header::unpack(buf)?;
-    if hdr.msg_type != MSG_BOOTSTRAP { return Err(Error::BadMsgType); }
-    if buf.len() != HEADER_LEN + hdr.payload_len as usize {
+    if hdr.msg_type != MSG_STATUS_DETAIL {
+        return Err(Error::BadMsgType);
+    }
+    validate_witness_sender_id(hdr.sender_id)?;
+
+    let nonce = derive_nonce(hdr.sender_id, hdr.timestamp_ms);
+    let (header_part, ct_part) = buf.split_at_mut(HEADER_LEN);
+    let pt_len = crypto::aead_decrypt(cluster_key, &nonce, header_part, ct_part)?;
+    if pt_len < 6 {
         return Err(Error::BadLength);
     }
-    let payload_len = hdr.payload_len as usize;
-    if payload_len < 32 + 32 + AEAD_TAG_LEN { return Err(Error::BadPayloadLen); }
-    if payload_len > 32 + 32 + BOOTSTRAP_INIT_PAYLOAD_MAX + AEAD_TAG_LEN {
-        return Err(Error::BadPayloadLen);
+    let witness_uptime_seconds = read_u32(ct_part, 0);
+    let target_sender_id = ct_part[4];
+    let sb = ct_part[5];
+
+    if sb & STATUS_DETAIL_NOT_FOUND_BIT != 0 {
+        // not found — v1 ignores other bits
+        if pt_len != 6 {
+            return Err(Error::BadLength);
+        }
+        return Ok(StatusDetailReader {
+            header: hdr,
+            witness_uptime_seconds,
+            target_sender_id,
+            found: false,
+            peer_ipv4: [0u8; 4],
+            peer_seen_ms_ago: 0,
+            peer_payload: &[],
+        });
     }
-    let pl = &buf[HEADER_LEN..HEADER_LEN + payload_len];
-    let mut eph_pub = [0u8; 32];
-    eph_pub.copy_from_slice(&pl[..32]);
-    let ct_len = payload_len - 32;
-
-    // Copy ciphertext into a local mutable buffer so we can decrypt in place.
-    let mut work = [0u8; 32 + BOOTSTRAP_INIT_PAYLOAD_MAX + AEAD_TAG_LEN];
-    work[..ct_len].copy_from_slice(&pl[32..]);
-
-    let shared = crypto::x25519_shared(witness_priv, &eph_pub);
-    let mut derived = [0u8; 32];
-    crypto::hkdf_sha256(&shared, &mut derived);
-    let aad = &buf[..HEADER_LEN];
-    let pt_len = crypto::aead_decrypt(&derived, aad, &mut work[..ct_len])?;
-    if pt_len < 32 { return Err(Error::BadPayloadLen); }
-
-    let mut cluster_key = [0u8; 32];
-    cluster_key.copy_from_slice(&work[..32]);
-    let init_len = pt_len - 32;
-    if init_len > BOOTSTRAP_INIT_PAYLOAD_MAX { return Err(Error::BadPayloadLen); }
-    let mut init_payload = [0u8; BOOTSTRAP_INIT_PAYLOAD_MAX];
-    init_payload[..init_len].copy_from_slice(&work[32..32 + init_len]);
-
-    Ok(BootstrapDecoded {
+    // found — bit 6 reserved (ignore for v2 fwd-compat); blocks in bits 0-5
+    let n_blocks = (sb & STATUS_DETAIL_BLOCKS_MASK) as usize;
+    if n_blocks > PAYLOAD_MAX_BLOCKS {
+        return Err(Error::BadField);
+    }
+    let expected = 6 + 4 + 4 + n_blocks * PAYLOAD_BLOCK_SIZE;
+    if pt_len != expected {
+        return Err(Error::BadLength);
+    }
+    let mut peer_ipv4 = [0u8; 4];
+    peer_ipv4.copy_from_slice(&ct_part[6..10]);
+    let peer_seen_ms_ago = read_u32(ct_part, 10);
+    let payload_start = 14;
+    let payload_end = payload_start + n_blocks * PAYLOAD_BLOCK_SIZE;
+    Ok(StatusDetailReader {
         header: hdr,
-        plaintext: BootstrapPlaintext {
-            cluster_key,
-            init_payload_len: init_len,
-            init_payload,
-        },
+        witness_uptime_seconds,
+        target_sender_id,
+        found: true,
+        peer_ipv4,
+        peer_seen_ms_ago,
+        peer_payload: &ct_part[payload_start..payload_end],
     })
 }
 
-// ─── BOOTSTRAP_ACK (0x21) ─────────────────────────────────────────────────
+// ── DISCOVER (0x04) — node → witness, unauthenticated ────────────────────
+
+pub fn encode_discover(
+    out: &mut [u8],
+    sender_id: u8,
+    timestamp_ms: i64,
+) -> Result<usize> {
+    validate_node_sender_id(sender_id)?;
+    if out.len() < DISCOVER_LEN {
+        return Err(Error::BadLength);
+    }
+    let hdr = Header { msg_type: MSG_DISCOVER, sender_id, timestamp_ms };
+    hdr.pack(&mut out[..HEADER_LEN]);
+    Ok(DISCOVER_LEN)
+}
+
+pub fn decode_discover(buf: &[u8]) -> Result<Header> {
+    if buf.len() != DISCOVER_LEN {
+        return Err(Error::BadLength);
+    }
+    let hdr = Header::unpack(buf)?;
+    if hdr.msg_type != MSG_DISCOVER {
+        return Err(Error::BadMsgType);
+    }
+    validate_node_sender_id(hdr.sender_id)?;
+    Ok(hdr)
+}
+
+// ── UNKNOWN_SOURCE (0x10) — witness → node, unauthenticated ──────────────
+
+pub fn encode_unknown_source(
+    out: &mut [u8],
+    timestamp_ms: i64,
+    witness_pubkey: &[u8; WITNESS_PUBKEY_LEN],
+) -> Result<usize> {
+    if out.len() < UNKNOWN_SOURCE_LEN {
+        return Err(Error::BadLength);
+    }
+    let hdr = Header {
+        msg_type: MSG_UNKNOWN_SOURCE,
+        sender_id: WITNESS_SENDER_ID,
+        timestamp_ms,
+    };
+    hdr.pack(&mut out[..HEADER_LEN]);
+    out[HEADER_LEN..HEADER_LEN + WITNESS_PUBKEY_LEN].copy_from_slice(witness_pubkey);
+    Ok(UNKNOWN_SOURCE_LEN)
+}
+
+pub struct UnknownSourceReader<'a> {
+    pub header: Header,
+    pub witness_pubkey: &'a [u8; WITNESS_PUBKEY_LEN],
+}
+
+pub fn decode_unknown_source(buf: &[u8]) -> Result<UnknownSourceReader<'_>> {
+    if buf.len() != UNKNOWN_SOURCE_LEN {
+        return Err(Error::BadLength);
+    }
+    let hdr = Header::unpack(buf)?;
+    if hdr.msg_type != MSG_UNKNOWN_SOURCE {
+        return Err(Error::BadMsgType);
+    }
+    validate_witness_sender_id(hdr.sender_id)?;
+    let witness_pubkey: &[u8; WITNESS_PUBKEY_LEN] =
+        buf[HEADER_LEN..HEADER_LEN + WITNESS_PUBKEY_LEN].try_into().unwrap();
+    Ok(UnknownSourceReader { header: hdr, witness_pubkey })
+}
+
+// ── BOOTSTRAP (0x20) — node → witness, AEAD via ECDH ─────────────────────
+
+pub fn encode_bootstrap(
+    out: &mut [u8],
+    sender_id: u8,
+    timestamp_ms: i64,
+    cluster_key: &[u8; CLUSTER_KEY_LEN],
+    witness_pubkey: &[u8; WITNESS_PUBKEY_LEN],
+    eph_priv: &[u8; 32],
+) -> Result<usize> {
+    validate_node_sender_id(sender_id)?;
+    if out.len() < BOOTSTRAP_LEN {
+        return Err(Error::BadLength);
+    }
+    let eph_pub = crypto::x25519_pub_from_priv(eph_priv);
+    let shared = crypto::x25519_shared(eph_priv, witness_pubkey);
+    let mut aead_key = [0u8; 32];
+    crypto::hkdf_sha256(&shared, &mut aead_key);
+
+    let hdr = Header { msg_type: MSG_BOOTSTRAP, sender_id, timestamp_ms };
+    hdr.pack(&mut out[..HEADER_LEN]);
+    out[HEADER_LEN..HEADER_LEN + EPH_PUBKEY_LEN].copy_from_slice(&eph_pub);
+
+    let aad = {
+        // Borrow header bytes immutably from out; need separate scope.
+        let mut tmp = [0u8; HEADER_LEN];
+        tmp.copy_from_slice(&out[..HEADER_LEN]);
+        tmp
+    };
+    let mut ct_buf = [0u8; CLUSTER_KEY_LEN + AEAD_TAG_LEN];
+    let n = crypto::aead_encrypt(
+        &aead_key,
+        &BOOTSTRAP_NONCE,
+        &aad,
+        cluster_key,
+        &mut ct_buf,
+    )?;
+    out[HEADER_LEN + EPH_PUBKEY_LEN..HEADER_LEN + EPH_PUBKEY_LEN + n]
+        .copy_from_slice(&ct_buf[..n]);
+    Ok(BOOTSTRAP_LEN)
+}
+
+pub fn decode_bootstrap(
+    buf: &mut [u8],
+    witness_priv: &[u8; 32],
+) -> Result<(Header, [u8; CLUSTER_KEY_LEN])> {
+    if buf.len() != BOOTSTRAP_LEN {
+        return Err(Error::BadLength);
+    }
+    let hdr = Header::unpack(buf)?;
+    if hdr.msg_type != MSG_BOOTSTRAP {
+        return Err(Error::BadMsgType);
+    }
+    validate_node_sender_id(hdr.sender_id)?;
+
+    let mut eph_pub = [0u8; EPH_PUBKEY_LEN];
+    eph_pub.copy_from_slice(&buf[HEADER_LEN..HEADER_LEN + EPH_PUBKEY_LEN]);
+    let shared = crypto::x25519_shared(witness_priv, &eph_pub);
+    let mut aead_key = [0u8; 32];
+    crypto::hkdf_sha256(&shared, &mut aead_key);
+
+    // AAD = first 14 bytes (header). Copy out before mutable split.
+    let mut aad = [0u8; HEADER_LEN];
+    aad.copy_from_slice(&buf[..HEADER_LEN]);
+
+    // Decrypt the ciphertext+tag in place.
+    let ct_start = HEADER_LEN + EPH_PUBKEY_LEN;
+    let pt_len = crypto::aead_decrypt(
+        &aead_key,
+        &BOOTSTRAP_NONCE,
+        &aad,
+        &mut buf[ct_start..],
+    )?;
+    if pt_len != CLUSTER_KEY_LEN {
+        return Err(Error::BadLength);
+    }
+    let mut cluster_key = [0u8; CLUSTER_KEY_LEN];
+    cluster_key.copy_from_slice(&buf[ct_start..ct_start + CLUSTER_KEY_LEN]);
+    Ok((hdr, cluster_key))
+}
+
+// ── BOOTSTRAP_ACK (0x21) — witness → node ────────────────────────────────
 
 pub fn encode_bootstrap_ack(
     out: &mut [u8],
-    sender_id: [u8; 8],
-    sequence: u64,
     timestamp_ms: i64,
     status: u8,
-    witness_uptime_ms: u64,
-    cluster_key: &[u8],
+    witness_uptime_seconds: u32,
+    cluster_key: &[u8; CLUSTER_KEY_LEN],
 ) -> Result<usize> {
-    if status != 0x00 && status != 0x01 { return Err(Error::BadField); }
-    let payload_len = 9;
-    let total = HEADER_LEN + payload_len + HMAC_LEN;
-    if out.len() < total { return Err(Error::BadLength); }
-    let hdr = Header {
-        msg_type: MSG_BOOTSTRAP_ACK, reserved: 0, sender_id,
-        sequence, timestamp_ms, payload_len: payload_len as u16,
-    };
-    hdr.pack(&mut out[..HEADER_LEN]);
-    out[HEADER_LEN] = status;
-    write_u64(out, HEADER_LEN + 1, witness_uptime_ms);
-    finalize_with_hmac(out, HEADER_LEN + payload_len, cluster_key);
-    Ok(total)
-}
-
-pub struct BootstrapAckView {
-    pub header: Header,
-    pub status: u8,
-    pub witness_uptime_ms: u64,
-}
-
-pub fn decode_bootstrap_ack(buf: &[u8], cluster_key: &[u8]) -> Result<BootstrapAckView> {
-    if buf.len() > MTU_CAP { return Err(Error::OverMtu); }
-    let body = verify_and_strip_hmac(buf, cluster_key)?;
-    let hdr = Header::unpack(body)?;
-    if hdr.msg_type != MSG_BOOTSTRAP_ACK { return Err(Error::BadMsgType); }
-    if hdr.payload_len != 9 || body.len() != HEADER_LEN + 9 {
+    if out.len() < BOOTSTRAP_ACK_LEN {
         return Err(Error::BadLength);
     }
-    let status = body[HEADER_LEN];
-    if status != 0x00 && status != 0x01 { return Err(Error::BadField); }
-    let witness_uptime_ms = read_u64(body, HEADER_LEN + 1);
-    Ok(BootstrapAckView { header: hdr, status, witness_uptime_ms })
+    let hdr = Header {
+        msg_type: MSG_BOOTSTRAP_ACK,
+        sender_id: WITNESS_SENDER_ID,
+        timestamp_ms,
+    };
+    hdr.pack(&mut out[..HEADER_LEN]);
+
+    let mut pt = [0u8; BOOTSTRAP_ACK_PLAINTEXT_LEN];
+    pt[0] = status;
+    write_u32(&mut pt, 1, witness_uptime_seconds);
+
+    let aad = {
+        let mut tmp = [0u8; HEADER_LEN];
+        tmp.copy_from_slice(&out[..HEADER_LEN]);
+        tmp
+    };
+    let mut ct_buf = [0u8; BOOTSTRAP_ACK_PLAINTEXT_LEN + AEAD_TAG_LEN];
+    let nonce = derive_nonce(WITNESS_SENDER_ID, timestamp_ms);
+    let n = crypto::aead_encrypt(cluster_key, &nonce, &aad, &pt, &mut ct_buf)?;
+    out[HEADER_LEN..HEADER_LEN + n].copy_from_slice(&ct_buf[..n]);
+    Ok(BOOTSTRAP_ACK_LEN)
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BootstrapAck {
+    pub header: Header,
+    pub status: u8,
+    pub witness_uptime_seconds: u32,
+}
+
+pub fn decode_bootstrap_ack(
+    buf: &mut [u8],
+    cluster_key: &[u8; CLUSTER_KEY_LEN],
+) -> Result<BootstrapAck> {
+    if buf.len() != BOOTSTRAP_ACK_LEN {
+        return Err(Error::BadLength);
+    }
+    let hdr = Header::unpack(buf)?;
+    if hdr.msg_type != MSG_BOOTSTRAP_ACK {
+        return Err(Error::BadMsgType);
+    }
+    validate_witness_sender_id(hdr.sender_id)?;
+
+    let nonce = derive_nonce(hdr.sender_id, hdr.timestamp_ms);
+    let (header_part, ct_part) = buf.split_at_mut(HEADER_LEN);
+    let pt_len = crypto::aead_decrypt(cluster_key, &nonce, header_part, ct_part)?;
+    if pt_len != BOOTSTRAP_ACK_PLAINTEXT_LEN {
+        return Err(Error::BadLength);
+    }
+    let status = ct_part[0];
+    let witness_uptime_seconds = read_u32(ct_part, 1);
+    Ok(BootstrapAck { header: hdr, status, witness_uptime_seconds })
+}
+
+/// BOOTSTRAP_ACK status helpers (PROTOCOL.md §5.7).
+#[inline]
+pub fn status_is_new(status: u8) -> bool {
+    status & 0x01 == 0
+}
+#[inline]
+pub fn status_is_idempotent(status: u8) -> bool {
+    status & 0x01 == 1
 }

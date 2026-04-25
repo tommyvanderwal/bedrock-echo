@@ -212,7 +212,7 @@ def test_heartbeat_anti_replay():
 
 
 def test_new_node_via_heartbeat_alone_returns_init():
-    """In v1 the new-node-join-via-HEARTBEAT scan has been removed.
+    """In Echo the new-node-join-via-HEARTBEAT scan has been removed.
     A new node's HEARTBEAT — even with a valid cluster_key — does NOT
     create a witness entry; the witness replies INIT and the node is
     expected to BOOTSTRAP."""
@@ -234,7 +234,7 @@ def test_new_node_via_heartbeat_alone_returns_init():
 
 
 def test_new_node_joins_via_bootstrap():
-    """The supported v1 flow for a 2nd node: it BOOTSTRAPs into the
+    """The supported flow for a 2nd node: it BOOTSTRAPs into the
     existing cluster (cookie-validated), then HEARTBEATs."""
     w, clock, pub = make_witness()
     w.handle_packet(encode_bootstrap(NODE_A, 1700_000_000_000, CK, pub,
@@ -269,7 +269,7 @@ def test_heartbeat_with_no_known_cluster_returns_init():
 
 
 def test_heartbeat_from_new_ip_returns_init_not_silent_takeover():
-    """v1 strict (src_ip, sender_id) match: a HEARTBEAT from a new IP
+    """Strict (src_ip, sender_id) match: a HEARTBEAT from a new IP
     for an existing sender_id does NOT silently update the stored IP.
     Witness replies INIT; node is expected to re-BOOTSTRAP."""
     w, clock, pub = make_witness()

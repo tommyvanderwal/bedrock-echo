@@ -1,11 +1,11 @@
-// Minimal bedrock-grade crypto for Bedrock Echo v1 on ESP32.
+// Minimal bedrock-grade crypto for Bedrock Echo on ESP32.
 //
 // * X25519 scalar-mult: embedded TweetNaCl reference impl (public domain).
 //   Constant-time, standalone, zero dependencies. Matches RFC 7748 byte-
 //   for-byte across all our reference impls.
 // * HKDF-SHA256, ChaCha20-Poly1305 (AEAD): mbedTLS (already in IDF).
 //
-// HMAC-SHA256 has been removed in v1 — Poly1305 (built into AEAD)
+// HMAC-SHA256 has been removed — Poly1305 (built into AEAD)
 // provides integrity for all authenticated messages.
 
 #include "echo.h"

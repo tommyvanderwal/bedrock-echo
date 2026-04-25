@@ -37,7 +37,7 @@ static void collect_entropy(uint8_t out[32]) {
     mbedtls_sha256_starts(&ctx, 0);
 
     // Mix the chip's MAC + boot counter-ish time as domain separation
-    uint8_t domain[] = "bedrock-echo x25519 seed v1";
+    uint8_t domain[] = "bedrock-echo x25519 seed";
     mbedtls_sha256_update(&ctx, domain, sizeof(domain));
 
     // ~2 s of RF-seeded reads, spaced out so the RNG reseeds between reads.

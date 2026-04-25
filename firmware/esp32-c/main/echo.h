@@ -1,4 +1,4 @@
-// Bedrock Echo v1 — protocol types + constants for the ESP32 C impl.
+// Bedrock Echo — protocol types + constants for the ESP32 C impl.
 // See PROTOCOL.md for the authoritative wire format and
 // docs/witness-implementation.md for witness-side behavior.
 
@@ -310,7 +310,7 @@ echo_err_t echo_encode_discover(uint8_t *out, size_t out_cap, size_t *out_len,
 echo_err_t echo_decode_discover(const uint8_t *buf, size_t buf_len,
                                  echo_header_t *out_header);
 
-// INIT (renamed from UNKNOWN_SOURCE in v1 polish; carries cookie)
+// INIT (renamed from UNKNOWN_SOURCE in polish; carries cookie)
 echo_err_t echo_encode_init(uint8_t *out, size_t out_cap, size_t *out_len,
                              int64_t timestamp_ms,
                              const uint8_t witness_pubkey[32],

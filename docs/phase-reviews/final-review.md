@@ -1,4 +1,4 @@
-# Bedrock Echo v1 — final review
+# Bedrock Echo — final review
 
 **Status: shippable.** Spec frozen, three reference implementations
 agree byte-for-byte, 117 tests passing across all of them, live
@@ -8,21 +8,21 @@ cross-language interop validated end-to-end.
 
 | Phase | Deliverable | Tests | Commit |
 |---|---|---|---|
-| 0 | PROTOCOL.md frozen v1 spec + design-notes + witness-implementation guide | — | `13f3264` |
+| 0 | PROTOCOL.md frozen spec + design-notes + witness-implementation guide | — | `13f3264` |
 | 1 | Python reference impl + test vector generator + 86 tests | 86 | `6748ff5` |
 | 2 | Rust impl (proto + witness crates), drops HMAC dependency | 23 | `a467eb4` |
 | 3 | C/ESP32 firmware with block allocator, AEAD-everywhere | (live boot) | `d8740c7` |
 | 4 | Cross-language interop validated against live ESP32 | 8 | (this commit) |
 
 Total: **117 unit/integration tests** plus **live interop verification**
-that Python NodeClient ↔ ESP32 v1 firmware exchange real packets
+that Python NodeClient ↔ ESP32 firmware exchange real packets
 correctly over real LAN UDP.
 
 ## What changed from where we started this session
 
 Wire format (header alone went from 32 B → 14 B):
 
-| | v0 | v1 |
+| | pre-Echo | Echo |
 |---|---|---|
 | Header | 32 B (magic + msg_type + reserved + 8B sender_id + 8B sequence + 8B timestamp + 2B payload_len) | **14 B** (magic + msg_type + 1B sender_id + 8B timestamp) |
 | Sender_id | 8 B | **1 B** (collision-resolved via AEAD trial) |
@@ -41,7 +41,7 @@ Wire format (header alone went from 32 B → 14 B):
 Typical small-cluster heartbeat exchange (HEARTBEAT 64 B + 16 B
 own_payload, then STATUS_DETAIL reply 96 B + 32 B peer_payload):
 
-| | v0 | v1 | Savings |
+| | pre-Echo | Echo | Savings |
 |---|---:|---:|---:|
 | HEARTBEAT (with 16 B own_payload) | 88 B | 64 B | 27% |
 | STATUS_DETAIL reply (with 32 B peer_payload) | 123 B | 76 B | 38% |
@@ -124,7 +124,7 @@ floor for LwIP + FreeRTOS + mbedTLS workspaces under load.
    test-infrastructure issues. Worth documenting clearly so future
    developers don't chase phantoms.
 
-## Items deferred / not in v1
+## Items deferred / not yet supported
 
 These were explicitly noted for later review and not blocking ship:
 
@@ -148,7 +148,7 @@ These were explicitly noted for later review and not blocking ship:
 
 ## What's ready to ship
 
-- `PROTOCOL.md` v1 — frozen wire spec.
+- `PROTOCOL.md` — frozen wire spec.
 - `docs/witness-implementation.md` — normative implementation guide.
 - `docs/design-notes.md` — design rationale (non-normative).
 - `docs/adoption/README.md` — per-system integration notes.
@@ -162,6 +162,6 @@ These were explicitly noted for later review and not blocking ship:
 
 ## Sign-off
 
-The Bedrock Echo v1 protocol is shippable. The implementation pass
+The Bedrock Echo protocol is shippable. The implementation pass
 is complete. The cross-language interop is verified live. Time to
 build things on top of it.

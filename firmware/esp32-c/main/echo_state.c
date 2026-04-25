@@ -1,4 +1,4 @@
-// Witness state + block allocator + age-out + rate limiting (ESP32 v1).
+// Witness state + block allocator + age-out + rate limiting (ESP32).
 //
 // State is fixed-size arrays (no malloc). Payloads live in `state->pool`,
 // a 64 KB region of 32-byte blocks; node entries reference their payload

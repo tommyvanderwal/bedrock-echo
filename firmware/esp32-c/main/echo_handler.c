@@ -1,6 +1,6 @@
-// Witness packet dispatcher (ESP32 v1, post-polish).
+// Witness packet dispatcher (ESP32, post-polish).
 //
-// v1 dispatch:
+// Dispatch:
 //   - DISCOVER → INIT (with cookie for src_ip, anti-amp 1.0× factor).
 //   - BOOTSTRAP → cookie pre-check, then AEAD-decrypt cluster_key.
 //   - HEARTBEAT → strict (src_ip, sender_id) match only. No
@@ -326,7 +326,7 @@ static bool handle_heartbeat(echo_state_t *state,
     uint8_t sid = hdr.sender_id;
 
     // Strict (src_ip, sender_id) match only. No sender_id-only fallback,
-    // no new-node-join scan — both removed in v1 polish.
+    // no new-node-join scan — both removed in polish.
     for (size_t i = 0; i < ECHO_MAX_NODES; ++i) {
         if (!state->nodes[i].in_use) continue;
         if (state->nodes[i].sender_id != sid) continue;

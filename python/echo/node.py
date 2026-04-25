@@ -1,4 +1,4 @@
-"""Bedrock Echo node-side client (v1).
+"""Bedrock Echo node-side client.
 
 Stateful enough to track timestamps, cache the witness's anti-spoof
 cookie, and auto-bootstrap on INIT or on heartbeat timeout (which can

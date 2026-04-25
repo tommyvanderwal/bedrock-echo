@@ -1,4 +1,4 @@
-"""Generate Bedrock Echo v1 test vectors.
+"""Generate Bedrock Echo test vectors.
 
 Run from the repo root:
     PYTHONPATH=python python3 testvectors/generate.py
@@ -66,7 +66,7 @@ def main():
     WITNESS_PUB = crypto.x25519_pub_from_priv(WITNESS_PRIV)
     BOOTSTRAP_COOKIE = crypto.derive_cookie(WITNESS_COOKIE_SECRET, BOOTSTRAP_SRC_IP)
 
-    print("Generating Bedrock Echo v1 test vectors")
+    print("Generating Bedrock Echo test vectors")
     print(f"  output dir: {OUT_DIR}")
     print()
 
@@ -291,7 +291,7 @@ def main():
 
     # MANIFEST file
     manifest = """\
-Bedrock Echo v1 test vectors
+Bedrock Echo test vectors
 ============================
 
 These vectors are the canonical cross-language contract for the protocol.

@@ -1,4 +1,4 @@
-"""Bedrock Echo wire-format encode/decode (v1).
+"""Bedrock Echo wire-format encode/decode.
 
 See PROTOCOL.md for the authoritative spec. Constants and layouts match
 that document byte-for-byte. Every function is pure: no I/O, no time.
@@ -361,7 +361,7 @@ class StatusDetail:
                 + self.peer_payload
             )
         else:
-            # not found: bit 7 = 1, other bits 0 in v1
+            # not found: bit 7 = 1, other bits 0
             status_byte = 0x80
             plaintext = struct.pack(">IBB",
                                     self.witness_uptime_seconds & 0xFFFFFFFF,
@@ -380,7 +380,7 @@ def decode_status_detail(buf: bytes, cluster_key: bytes) -> StatusDetail:
         raise ProtocolError("status_detail plaintext too short")
     up_s, target, sb = struct.unpack_from(">IBB", pt, 0)
     if sb & STATUS_DETAIL_NOT_FOUND_BIT:
-        # not found — bits 0-6 are reserved (v1 ignores them)
+        # not found — bits 0-6 are reserved (ignores them)
         if len(pt) != 6:
             raise ProtocolError("not_found plaintext must be exactly 6 bytes")
         return StatusDetail(

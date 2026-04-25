@@ -1,4 +1,4 @@
-# Post-v1 polish review — anti-amp + cookies + strict-IP
+# Post-polish review — anti-amp + cookies + strict-IP
 
 **Status:** spec + Python + Rust + ESP32 firmware shipped; live interop
 pending one flash of the ESP32.
@@ -59,8 +59,8 @@ final-review).
    is now consistent throughout the test file.
 
 2. **Stale generator helper** in `python/tools/gen_testvectors.py` —
-   pre-v1 dead code referencing `proto.UnknownSource(sender_id=...,
-   sequence=...)` that doesn't match the v1 API. Not a runtime bug
+   pre-polish dead code referencing `proto.UnknownSource(sender_id=...,
+   sequence=...)` that doesn't match the API. Not a runtime bug
    (unused), but worth cleaning up in a future tidy commit.
 
 3. **Spec internal consistency.** The §1 design-principles list grew

@@ -1,11 +1,11 @@
-"""Crypto primitives used by Bedrock Echo v1.
+"""Crypto primitives used by Bedrock Echo.
 
 Three primitives, all common-denominator across languages:
   - X25519              key agreement (BOOTSTRAP)
   - HKDF-SHA256         derive AEAD key from ECDH output (BOOTSTRAP)
   - ChaCha20-Poly1305   AEAD on every authenticated message
 
-HMAC-SHA256 has been removed in v1 — AEAD's Poly1305 tag provides
+HMAC-SHA256 has been removed — AEAD's Poly1305 tag provides
 integrity for all authenticated messages, so the HMAC trailer is no
 longer needed.
 """
@@ -102,7 +102,7 @@ def derive_cookie(witness_cookie_secret: bytes, src_ip_be: bytes) -> bytes:
     packets at the IP they're claiming.
 
     src_ip_be is 4 bytes for IPv4 in network byte order. (BOOTSTRAP is
-    IPv4-only in v1.)
+    IPv4-only.)
     """
     if len(witness_cookie_secret) != 32:
         raise ValueError("witness_cookie_secret must be 32 bytes")

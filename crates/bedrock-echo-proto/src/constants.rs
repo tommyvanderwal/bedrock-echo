@@ -1,4 +1,4 @@
-//! Constants locked by PROTOCOL.md v1. Do not change without bumping the
+//! Constants locked by PROTOCOL.md. Do not change without bumping the
 //! protocol identity (different magic + different UDP port).
 
 pub const MAGIC: &[u8; 4] = b"Echo";

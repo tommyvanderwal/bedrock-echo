@@ -143,7 +143,7 @@ fn heartbeat_unknown_sender_returns_init_with_pubkey_and_cookie() {
 
 #[test]
 fn new_node_via_heartbeat_alone_returns_init_no_state() {
-    // v1 polish: no new-node-join via HEARTBEAT. Node B's HEARTBEAT,
+    // polish: no new-node-join via HEARTBEAT. Node B's HEARTBEAT,
     // even with valid cluster_key, MUST NOT create an entry.
     let mut state = fresh_state(100_000);
     let src_a = [192, 168, 1, 10];
@@ -161,7 +161,7 @@ fn new_node_via_heartbeat_alone_returns_init_no_state() {
 
 #[test]
 fn new_node_joins_via_bootstrap() {
-    // The supported v1 flow: new node joins by BOOTSTRAP, then HEARTBEATs.
+    // The supported flow: new node joins by BOOTSTRAP, then HEARTBEATs.
     let mut state = fresh_state(100_000);
     let pubkey = state.witness_pub;
     let src_a = [192, 168, 1, 10];

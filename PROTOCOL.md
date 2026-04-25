@@ -1,4 +1,4 @@
-# Bedrock Echo Protocol — v1.0
+# Bedrock Echo Protocol
 
 **Status:** Frozen. Once implementations start shipping on firmware that goes
 into boxes we will never touch again, changes to this spec are forbidden. A
@@ -120,8 +120,8 @@ Any other `msg_type`: silently drop.
 
 Two message types carry an opaque variable-length application payload:
 HEARTBEAT (`own_payload`) and STATUS_DETAIL (`peer_payload`). BOOTSTRAP
-in v1 is single-purpose (cluster_key delivery) and carries no
-application payload.
+is single-purpose (cluster_key delivery) and carries no application
+payload.
 
 These payloads are encoded as **N blocks of 32 bytes each**, where N is
 declared by an inline u8 count field. Valid range: `N ∈ [0, 36]`. A value
@@ -360,19 +360,19 @@ Offset  Size  Name                     Type    Description
 
 Status_and_blocks byte:
   bit 7 (0x80):  0 = peer found, 1 = peer not found
-  bit 6 (0x40):  reserved (v1 senders MUST set 0; v1 receivers
-                 MUST ignore — forward-compat flag)
+  bit 6 (0x40):  reserved — senders MUST set 0; receivers MUST ignore
+                 (forward-compat extension point)
   bits 0-5 (0x3F):
     when bit 7 = 0 (found):     peer_payload block count (0..36)
     when bit 7 = 1 (not found): reserved future flags
-                                (v1 senders MUST set 0;
-                                 v1 receivers MUST ignore)
+                                (senders MUST set 0; receivers MUST ignore)
 
-Permitted v1 byte values:
+Permitted byte values:
   0x00..0x24 (0..36)   — found, that many blocks of peer_payload follow
   0x25..0x3F           — invalid (silent drop)
-  0x40..0x64           — bit-6 set (v2+ flag); v1 still extracts block
-                         count via (B & 0x3F); silent drop if > 36
+  0x40..0x64           — bit-6 set (forward-compat flag); current receivers
+                         still extract block count via (B & 0x3F);
+                         silent drop if > 36
   0x65..0x7F           — invalid (silent drop)
   0x80..0xFF           — not found (any reason flags in bits 0-6)
 ```
@@ -594,8 +594,8 @@ Offset  Size  Name                     Type    Description
                                                  0 = new entry created
                                                  1 = idempotent re-bootstrap
                                                bits 1-7 reserved
-                                               (v1 senders MUST set 0;
-                                                v1 receivers MUST ignore)
+                                               (senders MUST set 0;
+                                                receivers MUST ignore)
 1       4     witness_uptime_seconds   u32     seconds since witness boot
                                                (used for reboot detection)
 ─────────────────────────────────────────────────────────────────────
@@ -792,7 +792,7 @@ witness_cookie_secret  = 32 random bytes, generated at witness boot,
 
 cookie(secret, src_ip) = SHA-256(secret || src_ip_be)[:16]
                           src_ip_be = 4 bytes for IPv4 in network byte
-                          order (BOOTSTRAP over IPv4 only in v1).
+                          order (BOOTSTRAP is IPv4-only).
 
 Witness emits in INIT:
   cookie_out = cookie(witness_cookie_secret_current, src_ip)
@@ -842,9 +842,8 @@ The witness silently drops any packet that:
    `witness_cookie_secret` for the requester's src_ip (§11.2).
 10. HEARTBEAT or other steady-state authenticated message whose
     `(src_ip, sender_id)` does NOT match an existing node entry
-    (witness-implementation guide §1.2). The sender_id-only fallback
-    that was permitted in pre-v1 drafts has been removed; an IP change
-    requires re-BOOTSTRAP.
+    (witness-implementation guide §1.2). There is no sender_id-only
+    fallback; an IP change requires re-BOOTSTRAP.
 11. Witness state allocation fails (full).
 
 The only "error reply" defined is INIT (§5.5), and only in the
@@ -876,9 +875,9 @@ Node A boots:
 
 Node B boots later (cluster_key K already known to witness):
   B → witness: HEARTBEAT (encrypted under K)
-  witness has no (src_ip, sender_id) entry for B; the new-node-join
-              scan has been removed in v1, so the witness does not
-              attempt to AEAD-decrypt against existing cluster_keys.
+  witness has no (src_ip, sender_id) entry for B; there is no
+              new-node-join AEAD scan, so the witness does not attempt
+              to AEAD-decrypt against existing cluster_keys.
   witness → B: INIT (witness_pubkey + cookie_B)
   B verifies witness_pubkey; caches cookie_B.
   B → witness: BOOTSTRAP (cluster_key K, cookie_B)
@@ -889,9 +888,7 @@ Node B boots later (cluster_key K already known to witness):
   witness → B: STATUS_LIST (A and B both in the list)
 ```
 
-All new-node introductions go through BOOTSTRAP. This is a deliberate
-simplification over pre-v1 drafts: it folds the "new-node-join via
-HEARTBEAT scan" path into the BOOTSTRAP path, which is already
+All new-node introductions go through BOOTSTRAP, which is already
 cookie-validated and cryptographically anchored to the witness's
 pubkey. The cost is one extra round-trip per new node; the benefit is
 that **every node ever recorded at the witness has demonstrated
@@ -980,7 +977,7 @@ Test vectors live under `testvectors/` as pairs:
   timestamp, any randomness like eph_secret)
 - `NN_msgtype_description.out.bin` — the exact bytes on the wire
 
-v1 ships these vectors:
+The vectors:
 
 | Vector | Purpose |
 |---|---|
@@ -1021,9 +1018,9 @@ publicly identified).
   (per §12).
 - **Reserved bits in status bytes (secondary).** STATUS_DETAIL's
   `status_and_blocks` byte and BOOTSTRAP_ACK's `status` byte have
-  explicitly-reserved bits (v1 senders MUST zero, v1 receivers MUST
-  ignore). Future versions can use these bits for informational signals
-  that v1 receivers safely ignore.
+  explicitly-reserved bits (senders MUST zero, receivers MUST ignore).
+  Future deployments can use these bits for informational signals that
+  current receivers safely ignore.
 
 Reserved msg_type ranges:
 
@@ -1032,11 +1029,11 @@ Reserved msg_type ranges:
 - `0x22–0x2f`: future bootstrap-related types.
 - `0x30+`: cluster-management or other extensions.
 
-No specific extension is committed to in v1.
+No specific extension is committed to.
 
 ---
 
-## 17. Security notes (v1)
+## 17. Security notes
 
 **In scope:**
 - Forgery prevention: AEAD on all authenticated traffic.

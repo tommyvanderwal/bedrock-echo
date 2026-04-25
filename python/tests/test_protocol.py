@@ -1,4 +1,4 @@
-"""Wire-format encode/decode round-trip tests for Echo v1.
+"""Wire-format encode/decode round-trip tests for Echo.
 
 Run from the repo root:
     PYTHONPATH=python python3 -m pytest python/tests/ -v
@@ -261,7 +261,7 @@ def test_status_detail_max_payload():
 
 
 def test_status_detail_v2_flag_bit6_ignored_v1():
-    """A v2 implementation might set bit 6 of status_and_blocks. v1 receivers
+    """A v2 implementation might set bit 6 of status_and_blocks. receivers
     MUST ignore it (still extract block count from bits 0-5)."""
     sd = proto.StatusDetail(
         timestamp_ms=0, witness_uptime_seconds=0, target_sender_id=NODE_B,
@@ -281,7 +281,7 @@ def test_status_detail_v2_flag_bit6_ignored_v1():
     nonce = proto.derive_nonce(proto.WITNESS_SENDER_ID, 0)
     ct = crypto.aead_encrypt(CK, nonce, aad, pt_with_flag)
     wire_v2 = aad + ct
-    # v1 receiver must accept this — bit 6 is ignored, block count = 1
+    # receiver must accept this — bit 6 is ignored, block count = 1
     decoded = proto.decode_status_detail(wire_v2, CK)
     assert decoded.found is True
     assert decoded.peer_payload == b"\xCD" * 32
@@ -496,7 +496,7 @@ def test_bootstrap_ack_helpers():
 
 
 def test_bootstrap_ack_v2_upper_bits_ignored_v1():
-    """A v2 sender might set bits 1-7 of the status byte. v1 receivers MUST
+    """A v2 sender might set bits 1-7 of the status byte. receivers MUST
     decode those without dropping; bit 0 still carries the new/idempotent
     semantic."""
     header = proto.Header(proto.MSG_BOOTSTRAP_ACK, proto.WITNESS_SENDER_ID, 0)

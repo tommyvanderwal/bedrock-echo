@@ -12,7 +12,7 @@
 | `firmware/esp32-c/main/echo_crypto.c` | TweetNaCl X25519 + mbedTLS HKDF-SHA256 + ChaCha20-Poly1305. HMAC-SHA256 removed. AEAD encrypt/decrypt now take a nonce parameter. | ~225 |
 | `firmware/esp32-c/main/echo_state.c` | RAM-only state machine including the **block allocator** (no bitmap, node table is the allocation map), per-cluster offset adaptation, age-out tiers triggered by max(node_fill, pool_fill), per-IP rate limiting. | ~260 |
 | `firmware/esp32-c/main/echo_handler.c` | Dispatch + lookup chain. IP-first → sender_id → AEAD-against-every-cluster_key. Tri-state outcome (NotMine/Drop/Reply) prevents the anti-replay-bypass bug we caught in Rust phase. | ~290 |
-| `firmware/esp32-c/main/echo_info.c` | Boot info banner. `senderid=` line removed (witness id is fixed at 0xFF in v1). | (small edit) |
+| `firmware/esp32-c/main/echo_info.c` | Boot info banner. `senderid=` line removed (witness id is fixed at 0xFF). | (small edit) |
 | `firmware/esp32-c/main/main.c` | UDP loop. Now passes `src_port` to handler. | (small edit) |
 
 **Memory footprint (Olimex ESP32-POE-ISO):**
@@ -56,7 +56,7 @@ scratch reserve.
   (`800b1f47...22d16779`), confirming the X25519 priv survived the
   reflash via NVS.
 - `ping -c 3` returns sub-ms RTT.
-- Serial info banner shows the new v1 layout (no `senderid=` line).
+- Serial info banner shows the new layout (no `senderid=` line).
 
 ## What I didn't (deferred to Phase 4)
 
@@ -68,7 +68,7 @@ scratch reserve.
   Python client + ESP32 witness exchange real packets and decode each
   other's bytes, the wire format is correct. (Alternative: build a
   desktop-Linux unit-test harness that links the C code against
-  vectors. Out of scope for v1; the cross-language interop covers it.)
+  vectors. Out of scope; the cross-language interop covers it.)
 - **Stress tests** (many concurrent clusters, large payloads, age-out
   under load). Worth doing at some point; not a blocker.
 
@@ -162,7 +162,7 @@ already exposed the trap. Cross-implementation lessons compounding.
    sustained heartbeat load, this could occasionally cause a
    visible latency spike. Not a correctness issue. If it ever
    matters, we'd switch to incremental compaction (move N blocks per
-   call), but for v1 the simple synchronous approach is fine.
+   call), but the simple synchronous approach is fine.
 
 ## What's next (Phase 4 — Cross-language interop)
 
@@ -179,7 +179,7 @@ already exposed the trap. Cross-implementation lessons compounding.
 
 3. Verify the existing Python integration tests run unmodified
    against the new ESP32 witness — same `test_interop_live.py`
-   structure, just with v1 protocol.
+   structure, just with protocol.
 
 If Phase 4 passes, the spec is implementation-validated end-to-end
-and we can call v1 ready to ship.
+and we can call it ready to ship.

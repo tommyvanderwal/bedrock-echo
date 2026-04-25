@@ -1,11 +1,11 @@
-//! Crypto primitives used by Bedrock Echo v1.
+//! Crypto primitives used by Bedrock Echo.
 //!
 //! Three primitives, all common-denominator:
 //!   - X25519              key agreement (BOOTSTRAP)
 //!   - HKDF-SHA256         derive AEAD key from ECDH output (BOOTSTRAP)
 //!   - ChaCha20-Poly1305   AEAD on every authenticated message
 //!
-//! HMAC-SHA256 has been removed in v1 — Poly1305 (built into AEAD)
+//! HMAC-SHA256 has been removed — Poly1305 (built into AEAD)
 //! provides integrity for all authenticated messages.
 
 use crate::constants::{AEAD_TAG_LEN, COOKIE_LEN, HKDF_INFO};
@@ -40,7 +40,7 @@ pub fn hkdf_sha256(ikm: &[u8], out: &mut [u8; 32]) {
 ///
 /// The witness emits this in INIT and validates it on BOOTSTRAP.
 /// `src_ip_be` is 4 bytes for IPv4 in network byte order. (BOOTSTRAP
-/// is IPv4-only in v1.)
+/// is IPv4-only.)
 pub fn derive_cookie(witness_cookie_secret: &[u8; 32], src_ip_be: &[u8; 4]) -> [u8; COOKIE_LEN] {
     let mut hasher = Sha256::new();
     hasher.update(witness_cookie_secret);

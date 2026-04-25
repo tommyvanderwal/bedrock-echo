@@ -1,4 +1,4 @@
-//! Message encode/decode for all 7 msg_types (Bedrock Echo v1).
+//! Message encode/decode for all 7 msg_types (Bedrock Echo).
 //!
 //! Encoders write into caller-supplied buffers (no_std-friendly).
 //! Decoders verify AEAD/structure and return parsed views.
@@ -321,7 +321,7 @@ pub fn encode_status_detail_not_found(
     let mut pt = [0u8; 6];
     write_u32(&mut pt, 0, witness_uptime_seconds);
     pt[4] = target_sender_id;
-    pt[5] = STATUS_DETAIL_NOT_FOUND_BIT; // bit 7 = 1, bits 0-6 = 0 (v1)
+    pt[5] = STATUS_DETAIL_NOT_FOUND_BIT; // bit 7 = 1, bits 0-6 = 0 
 
     let aad = &out[..HEADER_LEN];
     let mut ct_buf = [0u8; 6 + AEAD_TAG_LEN];
@@ -366,7 +366,7 @@ pub fn decode_status_detail_into<'a>(
     let sb = ct_part[5];
 
     if sb & STATUS_DETAIL_NOT_FOUND_BIT != 0 {
-        // not found — v1 ignores other bits
+        // not found — ignores other bits
         if pt_len != 6 {
             return Err(Error::BadLength);
         }

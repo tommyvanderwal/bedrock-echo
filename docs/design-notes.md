@@ -505,7 +505,7 @@ one byte, while preserving forward-compat capacity for future flags:
 
 ```
 bit 7  (0x80):  status          0 = found, 1 = not found
-bit 6  (0x40):  reserved flag   v1 senders MUST zero, v1 receivers
+bit 6  (0x40):  reserved flag   senders MUST zero, receivers
                                 MUST ignore (NOT drop on non-zero)
 bits 5-0 (0x3F):
     when bit 7 = 0 (found):     block count 0..36 (valid), 37..63
@@ -513,19 +513,19 @@ bits 5-0 (0x3F):
     when bit 7 = 1 (not found): reserved future flags
                                 (e.g., "witness in cleanup mode",
                                 "aged out vs never seen", etc.)
-                                v1 senders MUST zero, v1 receivers
+                                senders MUST zero, receivers
                                 MUST ignore
 ```
 
-**v1 byte-value disposition:**
+**Byte-value disposition:**
 
-| Byte range | Interpretation | v1 behavior |
+| Byte range | Interpretation | Echo behavior |
 |---|---|---|
 | 0x00..0x24 | found, N blocks of peer_payload follow | normal |
 | 0x25..0x3F | invalid (bit 6=0 but bad count) | silent drop |
-| 0x40..0x64 | bit 6=1 (v2+ flag), N blocks with N=B&0x3F | v1: extract N, process normally (if N≤36) |
+| 0x40..0x64 | bit 6=1 (forward-compat flag), N blocks with N=B&0x3F | extract N, process normally (if N≤36) |
 | 0x65..0x7F | bit 6=1 + bad count | silent drop |
-| 0x80..0xFF | not found (any reason flags in bits 0-6) | v1: treat as not-found, ignore other bits |
+| 0x80..0xFF | not found (any reason flags in bits 0-6) | treat as not-found, ignore other bits |
 
 **Side-effect benefit:** `peer_payload` starts at offset 32 — 32-byte
 aligned. `peer_ipv4` and `peer_seen_ms_ago` at offsets 24 and 28 —
@@ -533,12 +533,12 @@ aligned. `peer_ipv4` and `peer_seen_ms_ago` at offsets 24 and 28 —
 
 **Two-point forward compat** vs the rejected header `reserved` byte:
 
-- The rejected byte was MUST-be-zero with no v1 meaning, meaning any
-  future use would break v1 parsers. Filler with a trap.
-- `status_and_blocks` has v1 meaning in bits 7 and 5-0. Bits
+- The rejected byte was MUST-be-zero with no defined meaning, meaning any
+  future use would break parsers. Filler with a trap.
+- `status_and_blocks` has defined meaning in bits 7 and 5-0. Bits
   6 (found-case flag) and 0-6 (not-found-case reason flags) are
-  **defined-as-ignored** in v1, so v2 extensions setting them don't
-  break v1 parsing. Principled capacity, not filler.
+  **defined-as-ignored**, so v2 extensions setting them don't
+  break parsing. Principled capacity, not filler.
 
 Future extensions through new `msg_type` values remain the primary
 extension point (principle 8). The flag-bit reservation is a
@@ -1061,11 +1061,11 @@ encrypt the ACK).
 bit 0:    0 = new entry created
           1 = idempotent re-bootstrap (cluster_key was already present
               for this sender_id)
-bits 1-7: reserved. v1 senders MUST zero. v1 receivers MUST ignore
+bits 1-7: reserved. senders MUST zero. receivers MUST ignore
           upper bits (don't drop on non-zero).
 ```
 
-Future use of bits 1-7 is for informational signals that v1 receivers
+Future use of bits 1-7 is for informational signals that receivers
 can safely ignore (e.g., "witness in cleanup mode," "shared with N+
 clusters"). Same forward-compat pattern as STATUS_DETAIL's status byte.
 
@@ -1083,7 +1083,7 @@ to previously-seen values from the same witness.
 
 ## 5.11 Items flagged for later review
 
-These are accepted for v1 in their current form, but the user has
+These are accepted for in their current form, but the user has
 flagged them for explicit reconsideration before finalising the spec.
 
 ### 5.11.1 New-node-join scan cost on the witness
@@ -1106,12 +1106,12 @@ repeated scans — potentially DoS the witness's scan budget.
   falling through to scan.
 - Total-scans-per-second-across-all-IPs ceiling on the witness.
 
-**Mitigation requiring protocol change (rejected for v1, recorded
+**Mitigation requiring protocol change (rejected, recorded
 for review):** revert to "every node BOOTSTRAPs at startup," which
 removes the scan path entirely but adds a round trip to every node
 startup.
 
-**Status:** keep §5.7 design as-is for v1. Treat the scan-DoS as a
+**Status:** keep §5.7 design as-is. Treat the scan-DoS as a
 witness-implementation problem to solve via rate-limiting and
 caching. Revisit if real-world deployment shows the implementation
 mitigations insufficient.
@@ -1127,7 +1127,7 @@ to one symmetric primitive. See §5.6.5.
 
 ## 6. Known limitations (not gaps)
 
-- **IPv4 only in v1.** The header carries no IP field (source IP
+- **IPv4 only.** The header carries no IP field (source IP
   comes from UDP/IP); only `peer_ipv4` (4 B) in STATUS_LIST and
   STATUS_DETAIL is IPv4-bound. IPv6 ships as new msg_type values
   (e.g. `STATUS_LIST_V6 = 0x04`, `STATUS_DETAIL_V6 = 0x05`) carrying
@@ -1270,7 +1270,7 @@ witness's CPU cost of cluster scanning under load (the worst case
 
 ### 7.6 Decided
 
-Yes, ship this as part of v1 before any external implementations
+Yes, ship this before any external implementations
 exist. The wire-format bumps for DISCOVER/INIT/BOOTSTRAP are isolated
 to bootstrap-only message types — the steady-state HEARTBEAT and
 STATUS_* formats are unchanged.

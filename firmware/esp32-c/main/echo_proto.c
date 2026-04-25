@@ -1,4 +1,4 @@
-// Wire-format encode/decode for Bedrock Echo v1.
+// Wire-format encode/decode for Bedrock Echo.
 
 #include "echo.h"
 #include <string.h>

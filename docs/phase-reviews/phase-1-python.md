@@ -59,7 +59,7 @@ fixed PROTOCOL.md to match the implementation's correct arithmetic.
 
 2. **Forward-compat patterns work as intended.** The status_and_blocks
    byte in STATUS_DETAIL has explicit tests for "v2 sender sets bit 6,
-   v1 receiver ignores it" — passes. Same for BOOTSTRAP_ACK's upper bits.
+   receiver ignores it" — passes. Same for BOOTSTRAP_ACK's upper bits.
    This gives us a documented, tested extension mechanism that isn't the
    "MUST be zero" trap.
 

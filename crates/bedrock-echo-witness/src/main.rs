@@ -96,7 +96,7 @@ fn main() {
                     IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
                         Some(v4) => v4.octets(),
                         None => {
-                            eprintln!("dropping v6 packet from {}: v6-only not in v1", src);
+                            eprintln!("dropping v6 packet from {}: v6-only not yet supported", src);
                             continue;
                         }
                     },

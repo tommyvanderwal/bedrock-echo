@@ -54,7 +54,7 @@ with different storage layouts surfaced the difference.
 - HMAC dependency dropped. `Cargo.toml` is now: `sha2 + hkdf +
   x25519-dalek + chacha20poly1305`. Minimum useful set.
 - HKDF info string updated to `b"bedrock-echo bootstrap"` (was
-  `b"bedrock-echo v1 bootstrap"`).
+  `b"bedrock-echo bootstrap"`).
 - AEAD nonce is now derived per-packet from the header (was hardcoded
   zero in the old design — only correct for BOOTSTRAP, which is the
   one place we keep zero-nonce because the aead_key is fresh per

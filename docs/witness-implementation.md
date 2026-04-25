@@ -43,8 +43,7 @@ candidates = nodes where
 if candidates is empty:
     rate-limited INIT reply (witness has no entry for this caller).
     DO NOT fall back to a sender_id-only scan; DO NOT attempt the
-    new-node-join AEAD scan. Both have been removed in v1 — see §1.4
-    and design-notes §7.
+    new-node-join AEAD scan. See §1.4 and design-notes §7.
 
 for c in candidates (optimization order, § 1.3):
     if aead_decrypt(packet, c.cluster_key) succeeds:
@@ -60,8 +59,8 @@ performance (otherwise sender_id scans degrade to O(N_total_nodes)) and
 for security: an off-path attacker spoofing the source IP cannot redirect
 or hijack an existing node entry's stored payload, because the witness
 will never AEAD-decrypt the packet against the legitimate node's
-cluster_key for a non-matching src_ip. (In v1, an IP change such as
-DHCP renewal requires a re-BOOTSTRAP; see PROTOCOL.md §13.4.)
+cluster_key for a non-matching src_ip. (An IP change such as DHCP
+renewal requires a re-BOOTSTRAP; see PROTOCOL.md §13.4.)
 
 ### 1.3 Per-(src_ip, src_port) candidate cache (RECOMMENDED)
 
@@ -94,7 +93,7 @@ cache directly.
 
 ### 1.4 New-node-join (NORMATIVE — via BOOTSTRAP only)
 
-In v1 there is no HEARTBEAT-driven new-node-join path. A node whose
+There is no HEARTBEAT-driven new-node-join path. A node whose
 (src_ip, sender_id) doesn't match an existing entry receives a
 rate-limited INIT and is expected to respond with a BOOTSTRAP. This
 unifies all node-introduction events under the cookie-validated
@@ -477,8 +476,8 @@ us1.echo.bedrock-it.com.    IN TXT  "v=Echo; k=x25519; p=BASE64_PUBKEY"
 ```
 
 **TXT format:**
-- `v=Echo1` distinguishes Echo records from other co-located TXT
-  (SPF, DKIM, etc.). Future protocols can use `v=Echo2`.
+- `v=Echo` distinguishes Echo records from other co-located TXT
+  (SPF, DKIM, etc.). Future protocols use a different value.
 - `k=x25519` declares key type. Future primitives use other values.
 - `p=…` is the X25519 pubkey, 32 raw bytes encoded as base64
   (44 chars with padding, fits one TXT string).
@@ -605,7 +604,7 @@ not a deployment profile.
 
 ## 9. Conformance checklist
 
-For an implementation to claim Bedrock Echo v1 conformance:
+For an implementation to claim Bedrock Echo conformance:
 
 - [ ] Parses the 14-byte header per PROTOCOL.md §2.
 - [ ] Implements all 7 wire msg_types per PROTOCOL.md §3-4.

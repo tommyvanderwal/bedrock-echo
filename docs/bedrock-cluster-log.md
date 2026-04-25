@@ -271,7 +271,7 @@ hash for the disaster-recovery case.
 ## 9. Open questions
 
 - **Entry payload schemas.** Each action type needs a defined payload.
-  That's deferable — BOOTSTRAP/PROMOTE/DEMOTE are enough for v1.
+  That's deferable — BOOTSTRAP/PROMOTE/DEMOTE are enough.
 - **Multi-witness support.** If 3 witnesses vote, do they need to agree
   on the tip hash? (Yes, probably, by the querying node.)
 - **Clock skew for `timestamp`.** Not trusted for ordering (index is);

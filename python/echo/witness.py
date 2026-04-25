@@ -1,4 +1,4 @@
-"""Stateful Bedrock Echo witness — v1 reference implementation.
+"""Stateful Bedrock Echo witness — reference implementation.
 
 Pure Python. RAM-only state. The UDP loop is a plain blocking socket.
 The packet-handler `handle_packet(data, (ip, port))` is pure logic so
@@ -416,7 +416,7 @@ class Witness:
     def _handle_heartbeat(self, data, hdr, ipv4, port, src):
         # Strict (src_ip, sender_id) match (PROTOCOL.md §13.4,
         # witness-implementation §1.2). No sender_id-only fallback,
-        # no new-node-join AEAD scan — both removed in v1 polish.
+        # no new-node-join AEAD scan — both removed in polish.
         candidates = self._find_nodes_by_ip_and_sender(ipv4, hdr.sender_id)
 
         for node in candidates:

@@ -1,4 +1,4 @@
-"""Cross-language live interop tests (v1).
+"""Cross-language live interop tests.
 
 Talks to a running Bedrock Echo witness binary (Rust or C/ESP32) from
 the Python NodeClient. Skipped unless BEDROCK_ECHO_WITNESS_ADDR is set.

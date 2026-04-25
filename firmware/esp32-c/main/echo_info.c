@@ -43,7 +43,7 @@ void echo_info_print(const echo_state_t *state, esp_netif_t *eth_netif) {
 
     // Machine-readable info block. Line-oriented key=value so a
     // provisioning script can grep -E '^(pub|mac|ip|port)='.
-    // (No senderid — in v1 the witness's sender_id is fixed at 0xFF.)
+    // (No senderid — the witness's sender_id is fixed at 0xFF.)
     printf("\n");
     printf("===BEDROCK-ECHO-WITNESS===\n");
     printf("pub=%s\n", pub_hex);

@@ -4,7 +4,7 @@
 //! UDP datagram and returns 0 or 1 reply bytes. Driving from a UDP loop:
 //!     for reply in handle(...) { sock.sendto(reply.as_slice(), src) }
 //!
-//! v1 dispatch (post-polish):
+//! Dispatch (post-polish):
 //!   - DISCOVER → INIT (with cookie for src_ip).
 //!   - BOOTSTRAP → cookie pre-check, then AEAD-decrypt cluster_key,
 //!     then create-or-update node entry.
@@ -196,7 +196,7 @@ fn handle_heartbeat(state: &mut State, data: &[u8], src_ipv4: [u8; 4],
 
     // Strict (src_ip, sender_id) match only (PROTOCOL.md §13.4,
     // witness-implementation §1.2). No sender_id-only fallback, no
-    // new-node-join AEAD scan — those have been removed in v1 polish.
+    // new-node-join AEAD scan — those have been removed in polish.
     if let Some(i) = state.find_node_by_ip_and_sender(&src_ipv4, sid) {
         let cs = state.nodes[i].cluster_slot as usize;
         let cluster_key = state.clusters[cs].cluster_key;

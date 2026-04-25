@@ -5,7 +5,7 @@ witness.** Wire format byte-exact across Python, Rust, and C.
 
 ## What was tested
 
-Python NodeClient ↔ ESP32 v1 witness firmware over real LAN UDP.
+Python NodeClient ↔ ESP32 witness firmware over real LAN UDP.
 Every message type exercised end-to-end:
 
 | Test | Message types | Result |
@@ -92,14 +92,14 @@ that into mechanical-end-to-end verification:
 - Every byte position, every field encoding, every nonce derivation
   matches.
 
-The Bedrock Echo v1 protocol is now implementation-validated
+The Bedrock Echo protocol is now implementation-validated
 end-to-end across three reference implementations on three different
 crypto stacks (Python `cryptography`, Rust `RustCrypto`, ESP32
 TweetNaCl + mbedTLS).
 
-## What's next (post-v1)
+## What's next (post-polish)
 
-Now that v1 is implementation-complete:
+Now that the implementation is complete:
 
 1. **Reference implementations in 2 more languages** (per the
    user's vision of 5+ implementations). Probably Go and JavaScript,
@@ -112,10 +112,10 @@ Now that v1 is implementation-complete:
    service.
 
 3. **Bedrock node daemon** integration: replace the existing daemon's
-   witness client with the new v1 NodeClient.
+   witness client with the new NodeClient.
 
 4. **DRBD pilot**: re-run the existing DRBD scenario harness against
-   the v1 witness (the harness is at `harness/scenarios.py` per the
+   the witness (the harness is at `harness/scenarios.py` per the
    project's earlier session notes). All 11 scenarios should pass.
 
 5. **NanoKVM Lite**: cross-compile the Rust witness binary for the

@@ -181,16 +181,23 @@ def test_vector_08_discover():
     assert proto.decode_discover(expected) == d
 
 
-# ── 09 UNKNOWN_SOURCE ─────────────────────────────────────────────────────
+# ── 09 INIT ───────────────────────────────────────────────────────────────
 
 
-def test_vector_09_unknown_source():
-    inputs, expected = vector("09_unknown_source")
+def test_vector_09_init():
+    inputs, expected = vector("09_init")
     pub = bytes.fromhex(inputs["witness_pubkey"])
-    us = proto.UnknownSource(timestamp_ms=inputs["timestamp_ms"],
-                             witness_pubkey=pub)
-    assert us.encode() == expected
-    assert proto.decode_unknown_source(expected) == us
+    cookie = bytes.fromhex(inputs["cookie"])
+    init = proto.Init(timestamp_ms=inputs["timestamp_ms"],
+                      witness_pubkey=pub, cookie=cookie)
+    assert init.encode() == expected
+    assert proto.decode_init(expected) == init
+
+    # Cross-check: the cookie in the vector must match
+    # SHA-256(witness_cookie_secret || src_ip)[:16].
+    secret = bytes.fromhex(inputs["witness_cookie_secret"])
+    src_ip = bytes(int(b) for b in inputs["src_ip"].split("."))
+    assert crypto.derive_cookie(secret, src_ip) == cookie
 
 
 # ── 10 BOOTSTRAP ──────────────────────────────────────────────────────────
@@ -201,10 +208,12 @@ def test_vector_10_bootstrap():
     cluster_key = bytes.fromhex(inputs["cluster_key"])
     witness_pubkey = bytes.fromhex(inputs["witness_pubkey"])
     eph_priv = bytes.fromhex(inputs["eph_priv"])
+    cookie = bytes.fromhex(inputs["cookie"])
     bs = proto.Bootstrap(
         sender_id=inputs["sender_id"],
         timestamp_ms=inputs["timestamp_ms"],
         cluster_key=cluster_key,
+        cookie=cookie,
     )
     wire = bs.encode(witness_pubkey, eph_priv)
     assert wire == expected
@@ -216,6 +225,7 @@ def test_vector_10_bootstrap():
     assert decoded.sender_id == inputs["sender_id"]
     assert decoded.timestamp_ms == inputs["timestamp_ms"]
     assert decoded.cluster_key == cluster_key
+    assert decoded.cookie == cookie
 
 
 # ── 11 BOOTSTRAP_ACK new ──────────────────────────────────────────────────
@@ -265,7 +275,7 @@ def test_all_vectors_present():
         "06_status_detail_found",
         "07_status_detail_not_found",
         "08_discover",
-        "09_unknown_source",
+        "09_init",
         "10_bootstrap",
         "11_bootstrap_ack_new",
         "12_bootstrap_ack_rebootstrap",

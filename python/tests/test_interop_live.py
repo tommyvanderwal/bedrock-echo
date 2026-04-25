@@ -25,17 +25,17 @@ from echo.node import NodeClient  # noqa: E402
 
 
 # Witness rate-limits incoming traffic at 10 pps + burst 20 per source IP,
-# and additionally caps UNKNOWN_SOURCE replies at 1/sec/IP. Tests in this
+# and additionally caps INIT replies at 1/sec/IP. Tests in this
 # module run many packets in tight succession from a single source IP, so
 # we yield briefly between tests to keep the witness's rate-limit budget
 # refreshed.
-UNKNOWN_RATE_DELAY = 1.2
+INIT_RATE_DELAY = 1.2
 
 
 @pytest.fixture(autouse=True)
 def _rate_limit_breather():
     """Yield briefly between tests so the witness's per-IP rate limit
-    refreshes and we don't starve subsequent tests of UNKNOWN_SOURCE
+    refreshes and we don't starve subsequent tests of INIT
     replies or burst tokens."""
     yield
     time.sleep(1.5)
@@ -67,7 +67,7 @@ def cluster_key():
 
 
 def test_discover_returns_witness_pubkey(addr, pub):
-    """DISCOVER → UNKNOWN_SOURCE with witness's pubkey."""
+    """DISCOVER → INIT with witness's pubkey."""
     n = NodeClient(sender_id=0x01, cluster_key=b"\x00" * 32,
                    witness_addr=addr, witness_pubkey=pub)
     us = n.discover()
@@ -76,8 +76,8 @@ def test_discover_returns_witness_pubkey(addr, pub):
 
 def test_heartbeat_first_with_auto_bootstrap(addr, pub, cluster_key):
     """The HEARTBEAT-first flow: NodeClient sends HEARTBEAT, receives
-    UNKNOWN_SOURCE, BOOTSTRAPs, retries HEARTBEAT, receives STATUS_LIST."""
-    time.sleep(UNKNOWN_RATE_DELAY)  # wait for witness's UNKNOWN_SOURCE budget
+    INIT, BOOTSTRAPs, retries HEARTBEAT, receives STATUS_LIST."""
+    time.sleep(INIT_RATE_DELAY)  # wait for witness's INIT budget
     n = NodeClient(sender_id=0x01, cluster_key=cluster_key,
                    witness_addr=addr, witness_pubkey=pub)
     sl = n.heartbeat_list(b"")

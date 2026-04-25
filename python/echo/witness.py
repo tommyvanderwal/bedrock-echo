@@ -6,12 +6,16 @@ unit tests can drive it without sockets.
 
 Implements PROTOCOL.md plus the witness-side behavior described in
 docs/witness-implementation.md:
-  - IP-first lookup with sender_id fallback
-  - New-node-join scan (try AEAD against all known cluster_keys)
+  - Strict (src_ip, sender_id) match on HEARTBEAT (no fallback,
+    no new-node-join scan — those were removed in the polish round;
+    all new-node introductions go through cookie-validated BOOTSTRAP)
+  - DNS-style anti-spoof cookie on BOOTSTRAP (PROTOCOL.md §11.2);
+    witness rotates witness_cookie_secret hourly, validates against
+    current or previous secret
   - Per-cluster wall-clock offset (no NTP required)
   - Strict-monotonic last_rx_timestamp / last_tx_timestamp per node/cluster
   - Age-out tiers (72h / 4h / 5min)
-  - Per-IP rate limiting + 1/s/IP cap on UNKNOWN_SOURCE replies
+  - Per-IP rate limiting + 1/s/IP cap on INIT replies
 """
 from __future__ import annotations
 
@@ -51,6 +55,9 @@ AGE_OUT_TIERS = (
 # Per-cluster offset adaptation bounds (PROTOCOL.md §6.2)
 MAX_BACKWARD_JUMP_MS = 1000     # reject packets > 1 s behind cluster frame
 MAX_BACKWARD_STEP_MS = 10       # adapt offset backward at most 10 ms/packet
+
+# Cookie-secret rotation period (PROTOCOL.md §11.2)
+COOKIE_SECRET_ROTATION_MS = 3600 * 1000   # 1 hour
 
 
 # ── State dataclasses ────────────────────────────────────────────────────
@@ -102,6 +109,8 @@ class Witness:
         self,
         witness_priv: bytes,
         clock_ms=None,
+        cookie_secret: bytes | None = None,
+        prev_cookie_secret: bytes | None = None,
     ):
         if len(witness_priv) != 32:
             raise ValueError("witness_priv must be 32 bytes")
@@ -114,6 +123,20 @@ class Witness:
         self.nodes: list[NodeEntry] = []                   # may have multiple entries with same sender_id
         self._next_cluster_slot = 0
         self.rate_limits: dict[bytes, RateLimiter] = {}    # ipv4 → RL
+        # Anti-spoof cookie state (PROTOCOL.md §11.2). Tests may pass
+        # fixed secrets for byte-exact reproducibility.
+        self._cookie_current: bytes = (
+            cookie_secret if cookie_secret is not None
+            else crypto.random_bytes(proto.WITNESS_COOKIE_SECRET_LEN)
+        )
+        self._cookie_previous: bytes = (
+            prev_cookie_secret if prev_cookie_secret is not None
+            else crypto.random_bytes(proto.WITNESS_COOKIE_SECRET_LEN)
+        )
+        if (len(self._cookie_current) != proto.WITNESS_COOKIE_SECRET_LEN
+                or len(self._cookie_previous) != proto.WITNESS_COOKIE_SECRET_LEN):
+            raise ValueError("cookie secrets must be 32 bytes each")
+        self._last_cookie_rotation_ms = self.start_ms
 
     # ── clock / helpers ──
 
@@ -129,6 +152,26 @@ class Witness:
             if n <= threshold:
                 return timeout
         return AGE_OUT_TIERS[-1][1]
+
+    def _maybe_rotate_cookie(self) -> None:
+        """Hourly cookie-secret rotation (PROTOCOL.md §11.2). Cheap O(1)
+        no-op when not yet due."""
+        now = self.now_ms()
+        if now - self._last_cookie_rotation_ms < COOKIE_SECRET_ROTATION_MS:
+            return
+        self._cookie_previous = self._cookie_current
+        self._cookie_current = crypto.random_bytes(proto.WITNESS_COOKIE_SECRET_LEN)
+        self._last_cookie_rotation_ms = now
+        log.info("rotated witness_cookie_secret")
+
+    def _cookie_for(self, ipv4: bytes) -> bytes:
+        return crypto.derive_cookie(self._cookie_current, ipv4)
+
+    def _cookie_valid(self, ipv4: bytes, cookie: bytes) -> bool:
+        return (
+            cookie == crypto.derive_cookie(self._cookie_current, ipv4)
+            or cookie == crypto.derive_cookie(self._cookie_previous, ipv4)
+        )
 
     def _age_out(self) -> None:
         now = self.now_ms()
@@ -253,6 +296,8 @@ class Witness:
 
         # Lazy age-out — cheap and runs on every packet.
         self._age_out()
+        # Hourly cookie rotation — also lazy, also cheap.
+        self._maybe_rotate_cookie()
 
         # Rate limit (refill/consume).
         if not self._allow(ipv4):
@@ -272,7 +317,7 @@ class Witness:
             return self._handle_heartbeat(data, hdr, ipv4, port, src)
         if hdr.msg_type == proto.MSG_DISCOVER:
             return self._handle_discover(data, hdr, ipv4, src)
-        # STATUS, ACKs, UNKNOWN_SOURCE are witness→node only (or ignored here).
+        # STATUS, ACKs, INIT are witness→node only (or ignored here).
         return []
 
     # ── DISCOVER ──
@@ -282,13 +327,24 @@ class Witness:
             return []
         if not self._allow(ipv4, is_unknown_reply=True):
             return []
-        us = proto.UnknownSource(timestamp_ms=hdr.timestamp_ms or self.uptime_ms(),
-                                 witness_pubkey=self.pub)
-        return [(us.encode(), src)]
+        init = proto.Init(
+            timestamp_ms=hdr.timestamp_ms or self.uptime_ms(),
+            witness_pubkey=self.pub,
+            cookie=self._cookie_for(ipv4),
+        )
+        return [(init.encode(), src)]
 
     # ── BOOTSTRAP ──
 
     def _handle_bootstrap(self, data, hdr, ipv4, port, src):
+        if len(data) != proto.BOOTSTRAP_LEN:
+            return []
+        # Cookie pre-check (PROTOCOL.md §11.2, witness-implementation §2.1).
+        # Cheap MAC; skip the AEAD/X25519 work on stale or forged cookies.
+        cookie_in = data[proto.HEADER_LEN:proto.HEADER_LEN + proto.COOKIE_LEN]
+        if not self._cookie_valid(ipv4, cookie_in):
+            log.debug("bootstrap cookie mismatch from %s", src)
+            return []
         try:
             bs = proto.decode_bootstrap(data, self.priv)
         except (proto.ProtocolError, proto.AuthError) as e:
@@ -358,13 +414,11 @@ class Witness:
     # ── HEARTBEAT ──
 
     def _handle_heartbeat(self, data, hdr, ipv4, port, src):
-        # Step 1: try IP+sender_id direct match.
+        # Strict (src_ip, sender_id) match (PROTOCOL.md §13.4,
+        # witness-implementation §1.2). No sender_id-only fallback,
+        # no new-node-join AEAD scan — both removed in v1 polish.
         candidates = self._find_nodes_by_ip_and_sender(ipv4, hdr.sender_id)
-        if not candidates:
-            # IP changed? Try sender_id alone.
-            candidates = self._find_nodes_by_sender(hdr.sender_id)
 
-        # Try AEAD decrypt against each candidate's cluster_key.
         for node in candidates:
             cluster = self.clusters.get(node.cluster_slot)
             if cluster is None:
@@ -381,46 +435,22 @@ class Witness:
             # Adapt cluster offset.
             if not self._adapt_cluster_offset(cluster, hb.timestamp_ms):
                 return []
-            # Update IP if it changed.
-            if node.sender_ipv4 != ipv4:
-                node.sender_ipv4 = ipv4
             node.sender_src_port = port
             node.last_rx_ms = self.now_ms()
             node.last_rx_timestamp = hb.timestamp_ms
             node.payload = hb.own_payload
             return [self._build_heartbeat_reply(hb, cluster, node, src)]
 
-        # No matching candidate. Try new-node-join scan: AEAD against every cluster_key.
-        for cluster in self.clusters.values():
-            try:
-                hb = proto.decode_heartbeat(data, cluster.cluster_key)
-            except proto.AuthError:
-                continue
-            except proto.ProtocolError:
-                return []
-            # Found a cluster that authenticates this packet → new node.
-            if len(self.nodes) >= MAX_NODES:
-                return []
-            if not self._adapt_cluster_offset(cluster, hb.timestamp_ms):
-                return []
-            new_node = NodeEntry(
-                sender_id=hdr.sender_id,
-                sender_ipv4=ipv4,
-                sender_src_port=port,
-                cluster_slot=cluster.cluster_slot,
-                last_rx_ms=self.now_ms(),
-                last_rx_timestamp=hb.timestamp_ms,
-                payload=hb.own_payload,
-            )
-            self.nodes.append(new_node)
-            cluster.num_nodes += 1
-            return [self._build_heartbeat_reply(hb, cluster, new_node, src)]
-
-        # Nothing matched anywhere. Reply UNKNOWN_SOURCE (rate-limited).
+        # No (src_ip, sender_id) match. Reply INIT (rate-limited) so the
+        # caller can re-BOOTSTRAP with a fresh cookie.
         if not self._allow(ipv4, is_unknown_reply=True):
             return []
-        us = proto.UnknownSource(timestamp_ms=self.uptime_ms(), witness_pubkey=self.pub)
-        return [(us.encode(), src)]
+        init = proto.Init(
+            timestamp_ms=self.uptime_ms(),
+            witness_pubkey=self.pub,
+            cookie=self._cookie_for(ipv4),
+        )
+        return [(init.encode(), src)]
 
     def _build_heartbeat_reply(self, hb, cluster, sending_node, src):
         ts_out = self._next_tx_timestamp(cluster)

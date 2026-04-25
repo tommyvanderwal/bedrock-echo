@@ -304,12 +304,23 @@ def test_status_detail_invalid_block_count_dropped():
 def test_discover_roundtrip():
     d = proto.Discover(sender_id=NODE_A, timestamp_ms=1700000000000)
     wire = d.encode()
-    assert len(wire) == 14
+    assert len(wire) == 62  # 14 B header + 48 B zero padding
     assert proto.decode_discover(wire) == d
 
 
+def test_discover_padding_is_zero():
+    d = proto.Discover(sender_id=NODE_A, timestamp_ms=0)
+    wire = d.encode()
+    assert wire[14:] == b"\x00" * 48
+
+
+def test_discover_request_size_matches_init_reply_size():
+    """Anti-amplification (PROTOCOL.md §1 principle 13): DISCOVER ≥ INIT."""
+    assert proto.DISCOVER_LEN == proto.INIT_LEN == 62
+
+
 def test_discover_rejects_wrong_size():
-    with pytest.raises(proto.ProtocolError, match="exactly 14"):
+    with pytest.raises(proto.ProtocolError, match="exactly 62"):
         proto.decode_discover(b"Echo\x04\x01" + b"\x00" * 8 + b"trailing")
 
 
@@ -318,37 +329,66 @@ def test_discover_rejects_witness_sender_id():
         proto.Discover(sender_id=0xFF, timestamp_ms=0).encode()
 
 
-# ── UNKNOWN_SOURCE (0x10) ─────────────────────────────────────────────────
+# ── INIT (0x10) ───────────────────────────────────────────────────────────
 
 
-def test_unknown_source_roundtrip():
+def _zero_cookie() -> bytes:
+    return b"\x00" * proto.COOKIE_LEN
+
+
+def test_init_roundtrip():
     pub = bytes(range(32))
-    us = proto.UnknownSource(timestamp_ms=1700000000000, witness_pubkey=pub)
-    wire = us.encode()
-    assert len(wire) == 46
-    assert proto.decode_unknown_source(wire) == us
+    cookie = bytes(range(16))
+    init = proto.Init(timestamp_ms=1700000000000, witness_pubkey=pub, cookie=cookie)
+    wire = init.encode()
+    assert len(wire) == 62
+    assert proto.decode_init(wire) == init
 
 
-def test_unknown_source_carries_pubkey():
+def test_init_carries_pubkey_and_cookie():
     pub = bytes([0xCC] * 32)
-    us = proto.UnknownSource(timestamp_ms=0, witness_pubkey=pub)
-    wire = us.encode()
-    decoded = proto.decode_unknown_source(wire)
+    cookie = bytes([0xEE] * 16)
+    init = proto.Init(timestamp_ms=0, witness_pubkey=pub, cookie=cookie)
+    decoded = proto.decode_init(init.encode())
     assert decoded.witness_pubkey == pub
+    assert decoded.cookie == cookie
 
 
-def test_unknown_source_zero_timestamp_ok():
+def test_init_zero_timestamp_ok():
     pub = bytes(32)
-    us = proto.UnknownSource(timestamp_ms=0, witness_pubkey=pub)
-    assert proto.decode_unknown_source(us.encode()) == us
+    init = proto.Init(timestamp_ms=0, witness_pubkey=pub, cookie=_zero_cookie())
+    assert proto.decode_init(init.encode()) == init
 
 
-def test_unknown_source_rejects_bad_size():
-    with pytest.raises(proto.ProtocolError, match="exactly 46"):
-        proto.decode_unknown_source(b"Echo\x10\xFF" + b"\x00" * 8)  # too short
+def test_init_rejects_bad_size():
+    with pytest.raises(proto.ProtocolError, match="exactly 62"):
+        proto.decode_init(b"Echo\x10\xFF" + b"\x00" * 8)  # too short
+
+
+def test_init_rejects_bad_cookie_len():
+    pub = bytes(32)
+    with pytest.raises(proto.ProtocolError, match="cookie must be"):
+        proto.Init(timestamp_ms=0, witness_pubkey=pub, cookie=b"short").encode()
+
+
+def test_cookie_derivation_matches_spec():
+    """cookie = SHA-256(witness_cookie_secret || src_ip_be)[:16]"""
+    secret = bytes([0xCC] * 32)
+    ip = bytes([192, 0, 2, 10])
+    cookie = crypto.derive_cookie(secret, ip)
+    assert len(cookie) == 16
+    # Same inputs → same cookie (deterministic)
+    assert crypto.derive_cookie(secret, ip) == cookie
+    # Different src_ip → different cookie
+    assert crypto.derive_cookie(secret, bytes([192, 0, 2, 11])) != cookie
+    # Different secret → different cookie
+    assert crypto.derive_cookie(bytes([0xDD] * 32), ip) != cookie
 
 
 # ── BOOTSTRAP (0x20) ──────────────────────────────────────────────────────
+
+
+_FIXED_COOKIE = bytes([0xAB] * 16)
 
 
 def test_bootstrap_roundtrip():
@@ -356,11 +396,12 @@ def test_bootstrap_roundtrip():
     eph_priv = bytes([0xBB] * 32)
     cluster_key = bytes([0x11] * 32)
     bs = proto.Bootstrap(sender_id=NODE_A, timestamp_ms=1700000001000,
-                         cluster_key=cluster_key)
+                         cluster_key=cluster_key, cookie=_FIXED_COOKIE)
     wire = bs.encode(w_pub, eph_priv)
-    assert len(wire) == 94
+    assert len(wire) == 110
     decoded = proto.decode_bootstrap(wire, w_priv)
     assert decoded.cluster_key == cluster_key
+    assert decoded.cookie == _FIXED_COOKIE
     assert decoded.sender_id == NODE_A
     assert decoded.timestamp_ms == 1700000001000
 
@@ -368,7 +409,7 @@ def test_bootstrap_roundtrip():
 def test_bootstrap_wrong_witness_priv_fails():
     w_priv, w_pub = crypto.x25519_generate()
     other_priv, _ = crypto.x25519_generate()
-    bs = proto.Bootstrap(NODE_A, 1, bytes([0x11] * 32))
+    bs = proto.Bootstrap(NODE_A, 1, bytes([0x11] * 32), cookie=_FIXED_COOKIE)
     wire = bs.encode(w_pub, bytes([0xBB] * 32))
     with pytest.raises(proto.AuthError):
         proto.decode_bootstrap(wire, other_priv)
@@ -376,26 +417,44 @@ def test_bootstrap_wrong_witness_priv_fails():
 
 def test_bootstrap_tampered_header_fails():
     w_priv, w_pub = crypto.x25519_generate()
-    bs = proto.Bootstrap(NODE_A, 1, bytes([0x11] * 32))
+    bs = proto.Bootstrap(NODE_A, 1, bytes([0x11] * 32), cookie=_FIXED_COOKIE)
     wire = bytearray(bs.encode(w_pub, bytes([0xBB] * 32)))
     wire[5] = NODE_B  # change sender_id (in AAD)
     with pytest.raises(proto.AuthError):
         proto.decode_bootstrap(bytes(wire), w_priv)
 
 
+def test_bootstrap_tampered_cookie_fails():
+    """Cookie sits in the AAD (header || cookie); modifying it must
+    invalidate the Poly1305 tag."""
+    w_priv, w_pub = crypto.x25519_generate()
+    bs = proto.Bootstrap(NODE_A, 1, bytes([0x11] * 32), cookie=_FIXED_COOKIE)
+    wire = bytearray(bs.encode(w_pub, bytes([0xBB] * 32)))
+    wire[20] ^= 0x01  # flip a bit in the cookie (bytes 14..30)
+    with pytest.raises(proto.AuthError):
+        proto.decode_bootstrap(bytes(wire), w_priv)
+
+
 def test_bootstrap_tampered_eph_pubkey_fails():
     w_priv, w_pub = crypto.x25519_generate()
-    bs = proto.Bootstrap(NODE_A, 1, bytes([0x11] * 32))
+    bs = proto.Bootstrap(NODE_A, 1, bytes([0x11] * 32), cookie=_FIXED_COOKIE)
     wire = bytearray(bs.encode(w_pub, bytes([0xBB] * 32)))
-    wire[20] ^= 0xFF  # mid-eph_pubkey
+    wire[40] ^= 0xFF  # mid-eph_pubkey (bytes 30..62)
     # Modifying eph_pubkey changes the derived key → AEAD fails
     with pytest.raises(proto.AuthError):
         proto.decode_bootstrap(bytes(wire), w_priv)
 
 
 def test_bootstrap_rejects_wrong_size():
-    with pytest.raises(proto.ProtocolError, match="exactly 94"):
+    with pytest.raises(proto.ProtocolError, match="exactly 110"):
         proto.decode_bootstrap(b"Echo\x20" + b"\x00" * 50, b"\x00" * 32)
+
+
+def test_bootstrap_rejects_bad_cookie_len():
+    _, w_pub = crypto.x25519_generate()
+    with pytest.raises(proto.ProtocolError, match="cookie must be"):
+        proto.Bootstrap(NODE_A, 1, bytes([0x11] * 32),
+                        cookie=b"short").encode(w_pub, bytes([0xBB] * 32))
 
 
 def test_bootstrap_fresh_eph_produces_different_ciphertext():
@@ -403,7 +462,7 @@ def test_bootstrap_fresh_eph_produces_different_ciphertext():
     must produce different ciphertexts (per-message key freshness)."""
     _, w_pub = crypto.x25519_generate()
     cluster_key = bytes([0x11] * 32)
-    bs = proto.Bootstrap(NODE_A, 1, cluster_key)
+    bs = proto.Bootstrap(NODE_A, 1, cluster_key, cookie=_FIXED_COOKIE)
     eph1 = bytes([0xBB] * 32)
     eph2 = bytes([0xCC] * 32)
     w1 = bs.encode(w_pub, eph1)

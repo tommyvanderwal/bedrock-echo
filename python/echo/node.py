@@ -1,12 +1,13 @@
 """Bedrock Echo node-side client (v1).
 
-Stateful enough to track timestamps and auto-bootstrap on UNKNOWN_SOURCE
-or on heartbeat timeout (which can mean a rate-limited UNKNOWN_SOURCE
-that got silently dropped).
+Stateful enough to track timestamps, cache the witness's anti-spoof
+cookie, and auto-bootstrap on INIT or on heartbeat timeout (which can
+mean a rate-limited INIT that got silently dropped).
 
 The flow is HEARTBEAT-first: we try heartbeat, and only fall back to
-BOOTSTRAP if the witness replies UNKNOWN_SOURCE (per PROTOCOL.md §13)
-or doesn't reply at all (likely rate-limited).
+BOOTSTRAP if the witness replies INIT (per PROTOCOL.md §13) or doesn't
+reply at all (likely rate-limited). The cached cookie is what makes
+the BOOTSTRAP valid; if we don't have one yet, we DISCOVER first.
 """
 from __future__ import annotations
 
@@ -28,6 +29,7 @@ class NodeClient:
     witness_pubkey: bytes                    # X25519 public, 32 bytes
     recv_timeout_s: float = 2.0
     _last_sent_ts: int = 0
+    _cached_cookie: bytes | None = None      # last cookie seen in INIT
 
     def __post_init__(self):
         if not (0 <= self.sender_id <= proto.NODE_SENDER_ID_MAX):
@@ -61,13 +63,22 @@ class NodeClient:
     # ── BOOTSTRAP ──
 
     def bootstrap(self) -> proto.BootstrapAck:
-        """Send a BOOTSTRAP, wait for ACK. Caller-friendly fallback used
-        only when HEARTBEAT-first hits UNKNOWN_SOURCE."""
+        """Send a BOOTSTRAP carrying the cached cookie, wait for ACK.
+
+        Caller is responsible for ensuring `self._cached_cookie` is set
+        before calling — typically by either receiving an INIT reply
+        (auto-cached on `_handle_init_reply`) or by calling `discover()`
+        explicitly. If no cookie is cached, we transparently call
+        `discover()` here to fetch one.
+        """
+        if self._cached_cookie is None:
+            self.discover()  # populates self._cached_cookie
         eph_priv, _ = crypto.x25519_generate()
         bs = proto.Bootstrap(
             sender_id=self.sender_id,
             timestamp_ms=self._next_ts(),
             cluster_key=self.cluster_key,
+            cookie=self._cached_cookie,
         )
         wire = bs.encode(self.witness_pubkey, eph_priv)
         reply = self._sendrecv(wire)
@@ -78,12 +89,15 @@ class NodeClient:
 
     # ── DISCOVER ──
 
-    def discover(self) -> proto.UnknownSource:
-        """Send a DISCOVER probe. Returns the witness's UNKNOWN_SOURCE reply
-        (which carries the witness's pubkey for verification)."""
+    def discover(self) -> proto.Init:
+        """Send a DISCOVER probe. Returns the witness's INIT reply
+        (carrying witness_pubkey + a fresh cookie for our src_ip).
+        Caches the cookie for use by subsequent BOOTSTRAPs."""
         d = proto.Discover(sender_id=self.sender_id, timestamp_ms=self._next_ts())
         reply = self._sendrecv(d.encode())
-        return proto.decode_unknown_source(reply)
+        init = proto.decode_init(reply)
+        self._cached_cookie = init.cookie
+        return init
 
     # ── HEARTBEAT — list query (peers + self) ──
 
@@ -100,7 +114,7 @@ class NodeClient:
         reply = self._heartbeat_core(peer_sender_id, own_payload)
         return proto.decode_status_detail(reply, self.cluster_key)
 
-    # ── core heartbeat with auto-bootstrap on UNKNOWN_SOURCE ──
+    # ── core heartbeat with auto-bootstrap on INIT ──
 
     def _heartbeat_core(self, target: int, own_payload: bytes) -> bytes:
         hb = proto.Heartbeat(
@@ -112,10 +126,21 @@ class NodeClient:
         try:
             reply = self._sendrecv(hb.encode(self.cluster_key))
         except (TimeoutError, socket.timeout):
-            # Witness might be rate-limiting UNKNOWN_SOURCE. Bootstrap
-            # unconditionally and retry. The bootstrap is authenticated via
-            # ECDH to witness_pubkey, so a rogue witness can't trick us.
-            log.info("heartbeat timed out (likely rate-limited UNKNOWN_SOURCE); bootstrapping")
+            # Witness might be rate-limiting INIT (1/s/IP). With cookies
+            # gating BOOTSTRAP, we need a fresh cookie before bootstrap —
+            # so DISCOVER first, which populates self._cached_cookie, then
+            # BOOTSTRAP, then retry the heartbeat. DISCOVER is authenticated
+            # at the application layer by checking witness_pubkey, and the
+            # subsequent BOOTSTRAP is X25519-ECDH-bound to witness_pubkey,
+            # so a rogue witness on the path can't trick us.
+            log.info("heartbeat timed out (likely rate-limited INIT); "
+                     "discovering + bootstrapping")
+            init = self.discover()
+            if init.witness_pubkey != self.witness_pubkey:
+                raise proto.AuthError(
+                    "discover returned pubkey mismatch — possible MITM, "
+                    "refusing to BOOTSTRAP"
+                )
             self.bootstrap()
             hb = proto.Heartbeat(
                 sender_id=self.sender_id,
@@ -125,15 +150,16 @@ class NodeClient:
             )
             return self._sendrecv(hb.encode(self.cluster_key))
 
-        # If it's UNKNOWN_SOURCE, bootstrap once then retry.
-        if len(reply) == proto.UNKNOWN_SOURCE_LEN and reply[4] == proto.MSG_UNKNOWN_SOURCE:
-            us = proto.decode_unknown_source(reply)
-            if us.witness_pubkey != self.witness_pubkey:
+        # If it's INIT, cache the cookie, bootstrap once, then retry.
+        if len(reply) == proto.INIT_LEN and reply[4] == proto.MSG_INIT:
+            init = proto.decode_init(reply)
+            if init.witness_pubkey != self.witness_pubkey:
                 raise proto.AuthError(
-                    "witness returned UNKNOWN_SOURCE but pubkey mismatch — "
+                    "witness returned INIT but pubkey mismatch — "
                     "possible MITM, refusing to BOOTSTRAP"
                 )
-            log.info("witness returned UNKNOWN_SOURCE, bootstrapping")
+            self._cached_cookie = init.cookie
+            log.info("witness returned INIT, bootstrapping with fresh cookie")
             self.bootstrap()
             hb = proto.Heartbeat(
                 sender_id=self.sender_id,

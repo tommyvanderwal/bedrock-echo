@@ -14,17 +14,19 @@ Vectors:
   05  STATUS_LIST empty                                           (cluster_key)
   06  STATUS_DETAIL found, 4-block peer_payload                   (cluster_key)
   07  STATUS_DETAIL not found                                     (cluster_key)
-  08  DISCOVER                                                    (no auth)
-  09  UNKNOWN_SOURCE with witness_pubkey                          (no auth)
-  10  BOOTSTRAP (fixed eph_priv)                                  (X25519 + AEAD)
+  08  DISCOVER (62 B, zero-padded)                                (no auth)
+  09  INIT with witness_pubkey + cookie                           (no auth)
+  10  BOOTSTRAP (fixed eph_priv, fixed cookie)                    (X25519 + AEAD)
   11  BOOTSTRAP_ACK status=0x00 (new)                             (cluster_key)
   12  BOOTSTRAP_ACK status=0x01 (idempotent)                      (cluster_key)
 
 Reproducibility constants (in .in.json files):
-  cluster_key   = 0x10..0x2F (32 bytes)
-  witness_priv  = 0xAA × 32  (used to derive witness_pubkey)
-  eph_priv      = 0xBB × 32  (used in BOOTSTRAP)
-  node A id     = 0x01
-  node B id     = 0x02
-  node C id     = 0x03
-  witness id    = 0xFF
+  cluster_key            = 0x10..0x2F (32 bytes)
+  witness_priv           = 0xAA × 32  (used to derive witness_pubkey)
+  witness_cookie_secret  = 0xCC × 32  (used to derive cookies in 09/10)
+  eph_priv               = 0xBB × 32  (used in BOOTSTRAP)
+  node A id              = 0x01
+  node B id              = 0x02
+  node C id              = 0x03
+  witness id             = 0xFF
+  bootstrap src_ip       = 192.0.2.10  (for cookie derivation in 09/10)

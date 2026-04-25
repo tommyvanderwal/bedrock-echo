@@ -1143,3 +1143,134 @@ to one symmetric primitive. See §5.6.5.
   HMAC-forgery capability for the whole cluster. Acceptable for LAN
   deployments where hosts are equally trusted; not acceptable for
   zero-trust models. See §14.
+
+---
+
+## 7. Anti-amp + cookies polish (post-Phase-4)
+
+After Phase 4 (cross-language interop verified live, 117 tests passing)
+the user pushed back on three weaknesses I had filed as "operational
+issues" rather than protocol issues:
+
+1. **Amplification.** The original DISCOVER was 14 B, the
+   UNKNOWN_SOURCE reply was 46 B → ~3.3× amplification factor. A
+   bot-net spoofing victim IPs could turn the witness into a UDP
+   reflector. "Operational compensation" via per-IP rate limit only
+   reduces the magnitude, not the existence of the vulnerability.
+
+2. **Cluster_key alone is 0 security from the witness's POV.** An
+   attacker can pick *any* random 32-byte string, call it
+   `cluster_key_attacker`, and BOOTSTRAP a brand-new cluster on the
+   witness with arbitrary src_ip. The witness installs the cluster.
+   This is an open-ended packet injection: with only the witness's
+   pubkey (which is public), an off-path attacker can spam cluster
+   creations, exhaust state, or — worse — spoof the BOOTSTRAP source
+   IP and use the witness as an amplifier toward the spoofed victim.
+
+3. **Sender_id-only fallback in HEARTBEAT** allowed an off-path
+   attacker who guessed (sender_id, cluster_key) — or just guessed
+   sender_id within an existing cluster they happen to know the key
+   of — to redirect the legitimate node's stored `sender_ipv4` to the
+   attacker's address. From then on, replies for that node go to the
+   attacker. The cluster_key membership requirement narrows the attack
+   surface but doesn't eliminate it (insider attack, or post-leak).
+
+### 7.1 The fix: DNS-cookie-style bind-to-IP on BOOTSTRAP, drop fallbacks
+
+Three coupled changes:
+
+- **DISCOVER → INIT request size = INIT reply size.** DISCOVER pads
+  to 62 B (zero-filled), INIT is 62 B (14 B header + 32 B pubkey +
+  16 B cookie). Amplification factor: exactly 1.0×.
+
+- **INIT carries a DNS-style cookie.** `cookie =
+  SHA-256(witness_cookie_secret || src_ip)[:16]`. The witness rotates
+  `witness_cookie_secret` hourly and keeps current+previous, giving
+  cookies a ~2 h validity window. The cookie is **not secret**; it's
+  a short MAC over src_ip under a witness-only key. Its job is to
+  force any BOOTSTRAP sender to prove they actually received an INIT
+  at the IP they're claiming.
+
+- **BOOTSTRAP MUST carry a valid cookie**, validated under
+  current-or-previous secret, and **strict (src_ip, sender_id) match
+  is required for HEARTBEAT** (the sender_id-only fallback and the
+  new-node-join-via-HEARTBEAT scan are both removed). All new node
+  introductions go through cookie-validated BOOTSTRAP. IP changes
+  (DHCP renewal) require re-BOOTSTRAP — costing two round-trips on
+  a rare event but eliminating the off-path IP-redirect attack class.
+
+### 7.2 Why "DNS cookies" specifically (vs alternatives considered)
+
+- **HMAC-on-every-packet (a la TCP cookies).** Adds 16+ B to every
+  HEARTBEAT — at hosted scale that's billions of bytes/day for what
+  AEAD already provides (the cluster_key MACs every steady-state
+  packet by construction). Rejected.
+
+- **Stateful three-way handshake (a la TCP SYN cookies but with
+  state).** Adds two round-trips and per-flow witness state. Defeats
+  the "tiny RAM-only witness" goal. Rejected.
+
+- **Puzzle-based proof-of-work.** Annoying for legitimate IoT-class
+  nodes; not actually a defense against well-resourced attackers.
+  Rejected.
+
+DNS cookies (RFC 7873) are the right precedent: they are the same
+"prove you can receive at this src_ip via a short stateless MAC"
+construction, used for the same reason (stateless DDoS hardening),
+adopted by the same kind of small-state-budget servers. Echo's
+cookie is structurally identical with the obvious renames.
+
+### 7.3 Why drop the new-node-join-via-HEARTBEAT scan
+
+Pre-polish, a new node could join an existing cluster simply by
+sending a HEARTBEAT under the right cluster_key — the witness would
+trial-AEAD-decrypt against known cluster_keys and, on match, allocate
+a node entry. This was elegant but allowed any holder of a leaked
+cluster_key to inject node entries from arbitrary spoofed src_ips.
+
+By forcing all new-node introductions through BOOTSTRAP, every node
+in the witness's table has been cookie-validated for src_ip ownership
+**and** demonstrated the cluster_key via AEAD — both, not just the
+second. The cost is one extra round-trip on first cluster-join (which
+also exists already on cold start), and a measurable reduction in the
+witness's CPU cost of cluster scanning under load (the worst case
+"AEAD-decrypt against every known cluster_key" path is gone).
+
+### 7.4 What remains 0-security-against (and why we accept it)
+
+- **Insider attack.** A node holding the cluster_key can forge any
+  HEARTBEAT under that key, including ones with their own (legit)
+  src_ip. Cookies don't prevent this; they aren't intended to.
+  Cluster-internal trust is the operator's concern.
+
+- **Replay of a captured BOOTSTRAP within the cookie window.** If
+  an on-path attacker captures node-A's BOOTSTRAP, they can replay
+  it within ~2 h. The replayed BOOTSTRAP hits the "existing entry"
+  path (same sender_id, same cluster_key under AEAD) → idempotent
+  ACK → the existing entry's `last_rx_timestamp` is already
+  monotonically ratcheted past the captured timestamp_ms (per §6.3),
+  so the replay is silently dropped. No state corruption.
+
+- **Active MITM at the network layer.** Out of scope for any UDP
+  protocol without TLS-style trust anchors. The DNSSEC pubkey-
+  distribution path closes this for hosted-witness deployments.
+
+### 7.5 Estimated cost
+
+- Wire: +48 B on DISCOVER, +16 B on INIT, +16 B on BOOTSTRAP.
+  These are one-time-per-cluster-membership events, so total bytes
+  on the wire over the lifetime of a cluster increase by < 0.01%.
+- Witness state: +64 B (2× witness_cookie_secret). No per-flow state.
+- Witness CPU: +1 SHA-256 per BOOTSTRAP and per emitted INIT.
+  Negligible (~µs).
+- Code: ~50 LoC per implementation for cookie generation/validation/
+  rotation. Plus deletion of the new-node-join scan and the
+  sender_id-only fallback (net code reduction in the steady-state
+  lookup path).
+
+### 7.6 Decided
+
+Yes, ship this as part of v1 before any external implementations
+exist. The wire-format bumps for DISCOVER/INIT/BOOTSTRAP are isolated
+to bootstrap-only message types — the steady-state HEARTBEAT and
+STATUS_* formats are unchanged.

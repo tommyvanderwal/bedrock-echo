@@ -19,9 +19,14 @@ On incoming UDP datagram:
 1. Validate UDP length ≥ 14 (header size).
 2. Parse and validate fixed header (magic, msg_type known).
 3. Route by msg_type:
-     - BOOTSTRAP  (0x20):        § 2 (bootstrap path)
-     - Other authenticated:      § 1.2 (steady-state path)
-     - UNKNOWN_SOURCE (0x10):    silently drop (witness-emitted, node-ignored)
+     - DISCOVER   (0x04):        validate length == 62, MAY check
+                                  zero-padding; emit rate-limited INIT
+                                  (with fresh cookie for src_ip).
+     - BOOTSTRAP  (0x20):        validate length == 110; § 2
+                                  (bootstrap path — cookie-validated).
+     - Other authenticated:      § 1.2 (steady-state path).
+     - INIT       (0x10):        silently drop (witness-emitted,
+                                  node-ignored on inbound).
 ```
 
 ### 1.2 Steady-state authentication (NORMATIVE)
@@ -36,28 +41,27 @@ candidates = nodes where
     node.sender_ipv4 == src_ip AND node.sender_id == sid
 
 if candidates is empty:
-    fallback: nodes where node.sender_id == sid
-    (handles node IP change / DHCP renewal)
-
-if candidates is still empty AND msg_type == HEARTBEAT:
-    new-node-join scan: try AEAD decrypt against each known cluster's
-    cluster_key. On match, allocate a new node entry under that cluster.
-    See § 1.4.
+    rate-limited INIT reply (witness has no entry for this caller).
+    DO NOT fall back to a sender_id-only scan; DO NOT attempt the
+    new-node-join AEAD scan. Both have been removed in v1 — see §1.4
+    and design-notes §7.
 
 for c in candidates (optimization order, § 1.3):
     if aead_decrypt(packet, c.cluster_key) succeeds:
-        if c matches by sender_id but not src_ip:
-            update c.sender_ipv4 = src_ip
-            update c.sender_src_port = src_port
+        update c.last_rx_timestamp, c.last_rx_ms, c.sender_src_port
         dispatch to handler for msg_type
         return
 
-no candidate verified → rate-limited UNKNOWN_SOURCE reply
+no candidate verified → rate-limited INIT reply
 ```
 
-The IP-first filter is **mandatory**. Without it, sender_id scans
-degrade to O(N_total_nodes) per packet and the protocol breaks under
-load (e.g., a hosted witness serving 10 000 clusters).
+The strict (src_ip, sender_id) match is **mandatory**, both for
+performance (otherwise sender_id scans degrade to O(N_total_nodes)) and
+for security: an off-path attacker spoofing the source IP cannot redirect
+or hijack an existing node entry's stored payload, because the witness
+will never AEAD-decrypt the packet against the legitimate node's
+cluster_key for a non-matching src_ip. (In v1, an IP change such as
+DHCP renewal requires a re-BOOTSTRAP; see PROTOCOL.md §13.4.)
 
 ### 1.3 Per-(src_ip, src_port) candidate cache (RECOMMENDED)
 
@@ -88,36 +92,23 @@ blowup: each node process uses its own ephemeral source port, so
 cache entries are per-process, and steady-state traffic hits the
 cache directly.
 
-### 1.4 New-node-join scan (NORMATIVE for HEARTBEAT)
+### 1.4 New-node-join (NORMATIVE — via BOOTSTRAP only)
 
-When a HEARTBEAT arrives whose (src_ip, sender_id) doesn't match any
-existing node entry — and the sender_id-only fallback also misses —
-the witness performs a new-node-join scan:
+In v1 there is no HEARTBEAT-driven new-node-join path. A node whose
+(src_ip, sender_id) doesn't match an existing entry receives a
+rate-limited INIT and is expected to respond with a BOOTSTRAP. This
+unifies all node-introduction events under the cookie-validated
+BOOTSTRAP path, so every entry in the node table has demonstrated:
 
-```
-For each cluster in known_clusters:
-    if aead_decrypt(packet, cluster.cluster_key) succeeds:
-        # New node joining an existing cluster.
-        allocate node entry n
-        if allocation fails: silent drop
-        populate n with sender_id, src_ip, src_port, cluster link,
-            last_rx_ms, last_rx_timestamp, etc.
-        dispatch HEARTBEAT normally (read query_target_id, etc.)
-        return
+- **src_ip ownership** via the cookie round-trip (PROTOCOL.md §11.2),
+- **cluster_key knowledge** via AEAD decryption of the BOOTSTRAP
+  ciphertext (PROTOCOL.md §4.3).
 
-no cluster matched → rate-limited UNKNOWN_SOURCE reply
-```
-
-This path is exercised when:
-- A new node joins an already-bootstrapped cluster.
-- A node recovers after its entry has aged out.
-
-Cost: O(N_clusters) AEAD decrypt attempts. At hosted scale (10 K
-clusters), ~100 ms CPU per scan event. These events are rare; per-IP
-rate-limiting on the expensive scan path is recommended (see § 5.1).
-
-For BOOTSTRAP (which has its own lookup path), no scan is needed —
-the message itself contains the cluster_key.
+Removing the HEARTBEAT-driven new-node scan also eliminates the
+witness's worst-case O(N_clusters) AEAD-decrypt loop and closes the
+"off-path attacker who knows a leaked cluster_key can inject node
+entries from arbitrary spoofed src_ips" attack surface. See
+design-notes §7 for the full rationale.
 
 ---
 
@@ -126,8 +117,20 @@ the message itself contains the cluster_key.
 ### 2.1 Lookup + semantics (NORMATIVE)
 
 ```
-parse eph_pubkey, AEAD-decrypt ciphertext to recover plaintext.
-plaintext = cluster_key (32 bytes)   ← this is all that's in there
+1. Cookie pre-check (before any crypto):
+   cookie_in        = packet bytes [14..30]
+   src_ip_be        = 4 bytes from UDP source IP
+   cookie_current   = SHA-256(witness_cookie_secret_current  || src_ip_be)[:16]
+   cookie_previous  = SHA-256(witness_cookie_secret_previous || src_ip_be)[:16]
+   if cookie_in != cookie_current AND cookie_in != cookie_previous:
+       silent drop (or rate-limited INIT — implementation choice;
+       both conformant per PROTOCOL.md §5.6).
+       DO NOT proceed to AEAD decryption.
+
+2. parse eph_pubkey, AEAD-decrypt ciphertext to recover plaintext.
+   AAD = packet bytes [0..30] (header || cookie).
+   plaintext = cluster_key (32 bytes)   ← this is all that's in there.
+   AEAD failure → silent drop.
 
 sid = sender_id from header
 K   = recovered cluster_key
@@ -382,9 +385,9 @@ it does not affect protocol behavior.
 isolated network) must still work. See design-notes §3.5 for
 the cross-cluster side-channel argument against NTP-as-truth.
 
-### 4.4 Timestamp in UNKNOWN_SOURCE replies (special case)
+### 4.4 Timestamp in INIT replies (special case)
 
-UNKNOWN_SOURCE is sent before any cluster relationship exists, so
+INIT is sent before any cluster relationship exists, so
 the per-cluster offset path doesn't apply. The witness MAY use,
 in order of preference:
 
@@ -394,12 +397,12 @@ in order of preference:
    approximately wall-clock for sane clusters; close enough for
    an informational field).
 3. The `timestamp_ms` field from the incoming HEARTBEAT that
-   triggered this UNKNOWN_SOURCE (the caller's claimed wall-clock,
+   triggered this INIT (the caller's claimed wall-clock,
    echoed back). Pure best-effort — caller may be lying or have a
-   bad clock, but UNKNOWN_SOURCE is unauthenticated anyway.
+   bad clock, but INIT is unauthenticated anyway.
 4. Zero. Always acceptable; signals "no usable wall-clock available."
 
-Receivers MUST treat UNKNOWN_SOURCE's timestamp_ms as informational
+Receivers MUST treat INIT's timestamp_ms as informational
 only — it is not authenticated and provides no security guarantee.
 
 ---
@@ -435,7 +438,7 @@ Tier thresholds (per PROTOCOL.md §10):
 ### 5.1 Rate limiting (NORMATIVE)
 
 Per source IP: token bucket, 10 packets/sec, burst 20. Packets over
-the limit: silently drop. UNKNOWN_SOURCE replies additionally
+the limit: silently drop. INIT replies additionally
 rate-limited to 1/sec/src-IP.
 
 Tracked IPs capped at ~192 slots (ESP32 big profile). When full,
@@ -448,7 +451,7 @@ deployments.
 ## 6. Pubkey distribution (deployment recipe)
 
 The protocol does not specify *how* a node obtains the witness's
-X25519 pubkey out-of-band — that's deployment policy. UNKNOWN_SOURCE
+X25519 pubkey out-of-band — that's deployment policy. INIT
 includes the witness's pubkey in its 32-byte payload, but that
 channel is unauthenticated and only useful as a verification check
 against an authenticated source. Three deployment patterns:
@@ -489,7 +492,7 @@ eu1.echo.bedrock-it.com.    IN TXT "v=Echo; k=x25519; p=OLD_BASE64"
 ```
 
 After rotation completes (witness has migrated to new privkey, all
-clients see new pubkey via UNKNOWN_SOURCE), remove the old TXT
+clients see new pubkey via INIT), remove the old TXT
 record.
 
 **Client discovery flow:**
@@ -500,14 +503,14 @@ record.
    → ranked list of (host, port) tuples
 3. For each host: A/AAAA → IP; TXT → set of valid pubkeys
 4. Send HEARTBEAT-with-garbage to each (IP, port)
-5. Receive UNKNOWN_SOURCE; extract witness's claimed pubkey
+5. Receive INIT; extract witness's claimed pubkey
 6. Verify claimed pubkey ∈ DNS-listed pubkeys for that host
 7. Match → present to operator as authenticated witness
    Mismatch → present as unverified (configuration drift or MITM
               candidate)
 ```
 
-The cross-check between DNS-listed pubkey and UNKNOWN_SOURCE-reported
+The cross-check between DNS-listed pubkey and INIT-reported
 pubkey provides defense-in-depth: an attacker would need to compromise
 both the DNSSEC chain *and* the network path.
 
@@ -519,13 +522,13 @@ QR-code-on-packaging. Standard registry-grade infrastructure.
 
 For self-hosted clusters: distribute pubkeys via the same channel
 that distributes other secrets (Ansible vault, Vault, SOPS-encrypted
-config, etcd-backed config-management system). UNKNOWN_SOURCE's
+config, etcd-backed config-management system). INIT's
 pubkey is a verification check; the configured pubkey is authoritative.
 
 ### 6.3 Manual provisioning (smallest deployments)
 
 Operator copies pubkey from witness's serial console output (printed
-on first boot, persistent in NVS) into cluster config. UNKNOWN_SOURCE
+on first boot, persistent in NVS) into cluster config. INIT
 serves as a "are these the same key?" sanity check.
 
 ### 6.4 Provisioning vs. discovery
@@ -549,7 +552,7 @@ Heartbeat cadence keeps mappings alive. Most stateful NATs retain
 UDP mappings for 30-120 seconds of idle. Default 2-second heartbeat
 is well inside this; sparse-heartbeat deployments (30+ s intervals)
 may see occasional first-packet-after-idle loss, healed by retry +
-UNKNOWN_SOURCE re-bootstrap.
+INIT re-bootstrap.
 
 The hosted-witness service model (3-5 public-IP witnesses hosted
 globally) works across arbitrary NAT topologies with zero
@@ -605,18 +608,26 @@ not a deployment profile.
 For an implementation to claim Bedrock Echo v1 conformance:
 
 - [ ] Parses the 14-byte header per PROTOCOL.md §2.
-- [ ] Implements all 6 wire msg_types per PROTOCOL.md §3-4.
+- [ ] Implements all 7 wire msg_types per PROTOCOL.md §3-4.
 - [ ] Passes all test vectors in `testvectors/` byte-exactly
       (encode and decode roundtrip).
-- [ ] Filters by source IP before sender_id lookup (§1.2 above).
+- [ ] Strict (src_ip, sender_id) match for steady-state lookups; no
+      sender_id-only fallback, no HEARTBEAT new-node-join scan
+      (§1.2, §1.4).
 - [ ] Implements collision resolution via AEAD trial decryption when
       multiple entries share sender_id (§1.2).
+- [ ] Generates and rotates `witness_cookie_secret` per PROTOCOL.md
+      §11.2 (current + previous, 1-hour rotation).
+- [ ] Validates the cookie on every BOOTSTRAP before AEAD decryption
+      (§2.1).
+- [ ] Pads DISCOVER to 62 B and accepts DISCOVER == 62 B (rejects
+      lengths < 62, MAY check zero-padding).
 - [ ] Enforces per-sender monotonic timestamp_ms (§4.1).
 - [ ] Supports full 0..1152 B payload range (no capping to smaller
       sizes).
 - [ ] Silently drops malformed, expired, or unverifiable packets
       (no error replies).
-- [ ] Rate-limits per-IP token bucket (§5.1).
+- [ ] Rate-limits per-IP token bucket (§5.1) and INIT 1/sec/IP.
 - [ ] Implements age-out tiers (§5).
 - [ ] If applicable (embedded/memory-constrained): implements
       block allocator + defrag per §3.2-3.3.

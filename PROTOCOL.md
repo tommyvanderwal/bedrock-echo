@@ -48,8 +48,19 @@ different protocol.
     collisions via AEAD verification.
 12. **Authenticated payloads are encrypted.** All authenticated message types
     use AEAD (ChaCha20-Poly1305) to provide both confidentiality and
-    integrity. Only DISCOVER and UNKNOWN_SOURCE are unauthenticated — those
-    are bootstrap-discovery messages and have no shared key.
+    integrity. Only DISCOVER and INIT are unauthenticated — those are
+    bootstrap-discovery messages and have no shared key.
+13. **No amplification.** Every unauthenticated request the witness will
+    reply to is sized **≥ the reply**. Specifically, DISCOVER (62 B,
+    zero-padded) → INIT (62 B). A spoofed-source DISCOVER cannot turn the
+    witness into a UDP amplifier — the reply is never larger than the
+    request.
+14. **Anti-spoofing via DNS-style cookies.** INIT carries a 16-byte
+    cookie bound to the requesting IP (`SHA-256(witness_cookie_secret ||
+    src_ip)[:16]`). BOOTSTRAP MUST carry a valid cookie (current or
+    previous secret). This proves the bootstrapper can actually receive
+    packets at its claimed source IP, defeating off-path BOOTSTRAP
+    spoofing without any per-flow witness state.
 
 ---
 
@@ -91,9 +102,9 @@ Every implementation MUST silently drop any packet where:
 | `0x01` | HEARTBEAT         | node → witness   | AEAD     | 32 + 32N B            |
 | `0x02` | STATUS_LIST       | witness → node   | AEAD     | 35 + 5N B             |
 | `0x03` | STATUS_DETAIL     | witness → node   | AEAD     | 36 (not found) / 44 + 32N B (found) |
-| `0x04` | DISCOVER          | node → witness   | none     | 14 B                  |
-| `0x10` | UNKNOWN_SOURCE    | witness → node   | none     | 46 B                  |
-| `0x20` | BOOTSTRAP         | node → witness   | AEAD-DH  | 94 B                  |
+| `0x04` | DISCOVER          | node → witness   | none     | 62 B (zero-padded)    |
+| `0x10` | INIT              | witness → node   | none     | 62 B                  |
+| `0x20` | BOOTSTRAP         | node → witness   | AEAD-DH  | 110 B                 |
 | `0x21` | BOOTSTRAP_ACK     | witness → node   | AEAD     | 35 B                  |
 
 Where `N` indicates a payload-specific block count or entry count, defined
@@ -107,9 +118,10 @@ Any other `msg_type`: silently drop.
 
 ### 4.1 Variable-length payload encoding
 
-Three message types carry an opaque variable-length application payload:
-HEARTBEAT (`own_payload`), STATUS_DETAIL (`peer_payload`), BOOTSTRAP
-(`init_payload` is removed in v1; see §4.5).
+Two message types carry an opaque variable-length application payload:
+HEARTBEAT (`own_payload`) and STATUS_DETAIL (`peer_payload`). BOOTSTRAP
+in v1 is single-purpose (cluster_key delivery) and carries no
+application payload.
 
 These payloads are encoded as **N blocks of 32 bytes each**, where N is
 declared by an inline u8 count field. Valid range: `N ∈ [0, 36]`. A value
@@ -164,12 +176,17 @@ Sender (node) computes:
                   L    = 32
                 )
   nonce       = [0x00] × 12   (safe: aead_key is unique per packet)
-  aad         = packet_bytes[0 .. 14]
+  aad         = packet_bytes[0 .. 30]   # 14 B header || 16 B cookie
   plaintext   = cluster_key  (32 B)
   ct, tag     = ChaCha20-Poly1305-Encrypt(aead_key, nonce, aad, plaintext)
   
 After encryption the sender MUST destroy eph_secret.
 ```
+
+The cookie sits in the AAD, so any tampering with the cookie field
+invalidates the Poly1305 tag. The witness independently validates the
+cookie before AEAD decryption (see §5.6 and §11.2); the AAD coverage is
+defense-in-depth.
 
 The receiver (witness) computes the **same** `shared` value:
 
@@ -188,7 +205,7 @@ encryption-key reuse with zero nonce, leaking plaintext XOR across messages.
 ### 4.4 Cryptographic guarantees
 
 For AEAD-encrypted messages (every message type except DISCOVER and
-UNKNOWN_SOURCE):
+INIT):
 
 | Property | Status | Mechanism |
 |---|---|---|
@@ -400,30 +417,54 @@ Not found   →   36 B
 
 Unauthenticated probe. The node asks the witness to identify itself.
 Used during operator-driven witness discovery (dashboard "add witnesses"
-flow) and for monitoring / latency probing.
+flow), for monitoring / latency probing, and to obtain a fresh anti-spoof
+cookie before BOOTSTRAP.
 
 ```
-14 B header only. No payload, no trailer.
-Total: 14 bytes.
+Offset  Size  Name              Type    Description
+─────────────────────────────────────────────────────────────────────
+── Header (14 B, plaintext) ────────────────────────────────────────
+0       4     magic             "Echo"
+4       1     msg_type          0x04
+5       1     sender_id         caller's chosen ID (informational only;
+                                witness echoes nothing back that depends
+                                on it)
+6       8     timestamp_ms      caller's wall-clock ms; informational
+                                (DISCOVER is unauthenticated)
+
+── Padding (48 B, plaintext) ───────────────────────────────────────
+14      48    pad               MUST be all-zero on send.
+                                Witness MAY drop if non-zero (strict
+                                parsing) but MUST NOT echo or process
+                                the bytes. Reserved for future
+                                forward-compat use via msg_type extension.
+─────────────────────────────────────────────────────────────────────
+Total: 62 bytes (fixed)
 ```
 
-The witness replies with **UNKNOWN_SOURCE (`0x10`)** — same as for
-authenticated messages that fail HMAC verification. Reusing
-UNKNOWN_SOURCE as the discovery reply means the protocol has one
-"witness identifies itself" message type instead of two.
+The padding makes the request size equal to the INIT reply size (62 B),
+so DISCOVER cannot be used as a UDP amplifier. A spoofed-source DISCOVER
+yields exactly one reply of equal size to the spoofed victim.
+
+The witness replies with **INIT (`0x10`)**. Reusing INIT as both the
+discovery reply and the "I don't know you, here's how to start" reply
+means the protocol has one "witness identifies itself" message type
+instead of two.
 
 DISCOVER is unauthenticated by necessity (no cluster_key exists to
 authenticate against during discovery). The reply is similarly
 unauthenticated; nodes verify the witness's pubkey out-of-band (DNSSEC
 TXT records, operator provisioning, or TOFU + human verification).
 
-### 5.5 UNKNOWN_SOURCE (`0x10`) — witness → node
+### 5.5 INIT (`0x10`) — witness → node
 
 Sent when the witness receives a DISCOVER, OR when it receives an
-authenticated message (HEARTBEAT, etc.) that fails AEAD verification
-against any known cluster_key for the sender_id and source IP. Carries
-the witness's X25519 public key so callers can verify it (against
-DNS-published or operator-provisioned values).
+unrecognised authenticated message (HEARTBEAT or BOOTSTRAP) — i.e. one
+whose `(src_ip, sender_id)` doesn't match any existing node entry, or
+whose AEAD/cookie verification fails. Carries the witness's X25519
+public key (so callers can verify it against DNS-published or
+operator-provisioned values) and a 16-byte anti-spoof cookie bound to
+the requester's source IP.
 
 ```
 Offset  Size  Name              Type    Description
@@ -436,26 +477,40 @@ Offset  Size  Name              Type    Description
                                 MAY be 0 if no clock source available;
                                 informational only — not authenticated
 
-── Payload (32 B, plaintext) ───────────────────────────────────────
+── Payload (48 B, plaintext) ───────────────────────────────────────
 14      32    witness_pubkey    the witness's X25519 public key
+46      16    cookie            anti-spoof token bound to requester's
+                                src_ip — see §11.2.
+                                The recipient MUST echo this byte-for-byte
+                                in its next BOOTSTRAP.
 
 ── No trailer ──────────────────────────────────────────────────────
                                 Unauthenticated; no AEAD/HMAC tag.
 ─────────────────────────────────────────────────────────────────────
-Total: 46 bytes
+Total: 62 bytes
 ```
 
-**Rate-limited:** witnesses MUST send no more than 1 UNKNOWN_SOURCE per
-source IP per second. Excess: silent drop.
+**Rate-limited:** witnesses MUST send no more than 1 INIT per source IP
+per second. Excess: silent drop.
+
+**Cookie semantics:** the cookie is **not secret** — it is a short MAC
+over the requester's src_ip under a witness-only secret. Its purpose is
+to force the bootstrapper to demonstrate it can actually receive packets
+at the IP it claims (round-trip proof of address ownership), defeating
+off-path spoofed-source BOOTSTRAPs without any per-flow witness state.
+See §11.2 for cookie generation and rotation.
 
 **Node-side handling:**
 - Nodes MUST verify `witness_pubkey` matches their configured/expected
   pubkey before initiating BOOTSTRAP.
 - Nodes with no configured pubkey AND not in explicit discovery mode
-  MUST ignore UNKNOWN_SOURCE (an attacker can spoof it).
+  MUST ignore INIT (an attacker can spoof it).
+- Nodes MUST cache the cookie and include it in the immediately-following
+  BOOTSTRAP. The cookie is single-use-recommended but, due to the
+  witness-side rotation window, MAY be reused for ≤ 1 hour as long as
+  the witness still validates it.
 - Nodes SHOULD rate-limit their own re-bootstrap response (e.g., no more
-  than one BOOTSTRAP per 30 seconds in response to repeated
-  UNKNOWN_SOURCE).
+  than one BOOTSTRAP per 30 seconds in response to repeated INIT).
 
 ### 5.6 BOOTSTRAP (`0x20`) — node → witness
 
@@ -474,21 +529,28 @@ Offset  Size  Name                Type    Description
                                   cluster's time offset on the witness
                                   for subsequent per-cluster timestamping
 
+── Cookie (16 B, plaintext, AAD) ───────────────────────────────────
+14      16    cookie              echoed verbatim from the most recent
+                                  INIT received from this witness for
+                                  this src_ip. Witness MUST validate
+                                  before AEAD decryption (see §11.2);
+                                  mismatch → silent drop.
+
 ── Ephemeral pubkey (32 B, plaintext) ──────────────────────────────
-14      32    eph_pubkey          freshly-generated X25519 public key.
+30      32    eph_pubkey          freshly-generated X25519 public key.
                                   The matching private key MUST be
                                   destroyed by the sender after
                                   encryption.
 
 ── Encrypted cluster_key + tag (48 B) ──────────────────────────────
-46      32    encrypted_          ciphertext of the 32-byte cluster_key,
+62      32    encrypted_          ciphertext of the 32-byte cluster_key,
               cluster_key         under aead_key derived from
                                   X25519(eph_secret, witness_pubkey)
                                   via HKDF-SHA256.
-78      16    poly1305_tag        AEAD tag covering the ciphertext
-                                  and the 14-byte header (AAD).
+94      16    poly1305_tag        AEAD tag covering the ciphertext
+                                  and the 30 B AAD (header || cookie).
 ─────────────────────────────────────────────────────────────────────
-Total: 94 bytes (fixed)
+Total: 110 bytes (fixed)
 ```
 
 Crypto details: see §4.3.
@@ -505,7 +567,13 @@ the witness implementation guide; semantics summary):
 
 In all success cases, the witness replies with BOOTSTRAP_ACK.
 
-**Failure modes** (silent drop, no UNKNOWN_SOURCE reply):
+**Failure modes** (silent drop, no INIT reply unless explicitly noted):
+- Cookie verification fails (no match against current or previous
+  witness_cookie_secret). The witness MAY reply INIT (with a fresh
+  cookie) on cookie mismatch — same per-IP rate limit as for any other
+  INIT — so a node that has a stale cookie can recover by re-trying.
+  Implementations MAY simply silent-drop and let the node re-discover
+  via the HEARTBEAT-first / DISCOVER path; both are conformant.
 - AEAD verification fails (wrong pubkey, tampering, stale capture).
 - `eph_pubkey` is an X25519 invalid input that yields zero shared
   secret (RFC 7748 small-subgroup elements).
@@ -698,18 +766,60 @@ this reclamation, the cluster entry is also dropped.
 
 ---
 
-## 11. Rate limiting
+## 11. Rate limiting and cookies
+
+### 11.1 Per-source-IP rate limits
 
 Per source IP, the witness enforces a token bucket: 10 packets/second,
 burst 20. Over the limit: silently dropped.
 
-UNKNOWN_SOURCE replies have an additional per-source-IP rate limit of
-1/second.
+INIT replies have an additional per-source-IP rate limit of 1/second.
 
 Tracked IPs are capped (e.g., 192 slots on ESP32 big profile); when the
 table is full, the oldest entry is evicted. Anti-flood hygiene for small
 LANs; production deployments are expected to firewall upstream of the
 witness.
+
+### 11.2 Anti-spoof cookies (NORMATIVE)
+
+The witness generates the 16-byte cookie in INIT replies and validates
+it on incoming BOOTSTRAPs:
+
+```
+witness_cookie_secret  = 32 random bytes, generated at witness boot,
+                          rotated every 3600 s. Witness keeps both the
+                          current and the immediately-previous secret.
+
+cookie(secret, src_ip) = SHA-256(secret || src_ip_be)[:16]
+                          src_ip_be = 4 bytes for IPv4 in network byte
+                          order (BOOTSTRAP over IPv4 only in v1).
+
+Witness emits in INIT:
+  cookie_out = cookie(witness_cookie_secret_current, src_ip)
+
+Witness validates on BOOTSTRAP:
+  ok = (cookie_in == cookie(witness_cookie_secret_current, src_ip))
+       OR
+       (cookie_in == cookie(witness_cookie_secret_previous, src_ip))
+  if not ok: silent drop (or rate-limited INIT, see §5.6 failure modes)
+```
+
+**Properties:**
+
+1. **Round-trip proof.** A correct cookie proves the BOOTSTRAP sender
+   actually received an INIT at the source IP they're claiming. Off-path
+   spoofers cannot forge it.
+2. **No per-flow witness state.** The witness stores only the two
+   `witness_cookie_secret` values (32 B each). All cookie state is in
+   the secrets, not per-IP entries.
+3. **Bounded cookie lifetime.** A cookie remains valid for at most
+   ~2 hours (current + previous secret window).  After rotation,
+   captured cookies expire automatically.
+4. **Reboot resilience.** On witness reboot, both secrets regenerate
+   and all in-flight cookies become invalid. Nodes recover transparently
+   via the HEARTBEAT-first → INIT → BOOTSTRAP loop.
+5. **No port binding.** The cookie binds only `src_ip`, not `src_port`.
+   This survives NAT mapping changes between INIT and BOOTSTRAP.
 
 ---
 
@@ -728,10 +838,18 @@ The witness silently drops any packet that:
 7. Has block-count or entry-count fields outside their valid range.
 8. BOOTSTRAP with `eph_pubkey` that yields a zero shared secret
    (small-subgroup attack defense).
-9. Witness state allocation fails (full).
+9. BOOTSTRAP with a cookie that doesn't match the current or previous
+   `witness_cookie_secret` for the requester's src_ip (§11.2).
+10. HEARTBEAT or other steady-state authenticated message whose
+    `(src_ip, sender_id)` does NOT match an existing node entry
+    (witness-implementation guide §1.2). The sender_id-only fallback
+    that was permitted in pre-v1 drafts has been removed; an IP change
+    requires re-BOOTSTRAP.
+11. Witness state allocation fails (full).
 
-The only "error reply" defined is UNKNOWN_SOURCE (§5.5), and only in the
-specific cases noted there.
+The only "error reply" defined is INIT (§5.5), and only in the
+specific cases noted there (DISCOVER; or unrecognised authenticated
+message, subject to per-IP rate limit).
 
 ---
 
@@ -745,22 +863,39 @@ Operator provisions cluster_key K to all nodes via out-of-band channel
 
 Node A boots:
   A → witness: HEARTBEAT (encrypted under K)
-  witness has no entry for A, no cluster has K registered yet.
-  witness → A: UNKNOWN_SOURCE (with witness_pubkey)
-  A verifies witness_pubkey against expected.
-  A → witness: BOOTSTRAP (cluster_key K, encrypted to witness_pubkey)
-  witness installs cluster K, creates node entry for A.
+  witness has no (src_ip, sender_id) entry for A.
+  witness → A: INIT (witness_pubkey + cookie_A)
+  A verifies witness_pubkey against expected; caches cookie_A.
+  A → witness: BOOTSTRAP (cluster_key K, cookie_A in AAD, encrypted
+              to witness_pubkey)
+  witness validates cookie_A under current secret; AEAD-decrypts;
+              installs cluster K, creates node entry for A.
   witness → A: BOOTSTRAP_ACK (status=0x00 new)
   A → witness: HEARTBEAT (encrypted under K, with own_payload)
   witness → A: STATUS_LIST (only A is in the list)
 
-Node B boots later:
+Node B boots later (cluster_key K already known to witness):
   B → witness: HEARTBEAT (encrypted under K)
-  witness has entry for A (under K), no entry for B.
-  Tries B's HMAC against K (via collision-resolution scan); succeeds.
-  witness creates node entry for B under cluster K.
+  witness has no (src_ip, sender_id) entry for B; the new-node-join
+              scan has been removed in v1, so the witness does not
+              attempt to AEAD-decrypt against existing cluster_keys.
+  witness → B: INIT (witness_pubkey + cookie_B)
+  B verifies witness_pubkey; caches cookie_B.
+  B → witness: BOOTSTRAP (cluster_key K, cookie_B)
+  witness validates cookie; AEAD-decrypts; finds existing cluster K,
+              creates node entry for B under it.
+  witness → B: BOOTSTRAP_ACK (status=0x00 new)
+  B → witness: HEARTBEAT
   witness → B: STATUS_LIST (A and B both in the list)
 ```
+
+All new-node introductions go through BOOTSTRAP. This is a deliberate
+simplification over pre-v1 drafts: it folds the "new-node-join via
+HEARTBEAT scan" path into the BOOTSTRAP path, which is already
+cookie-validated and cryptographically anchored to the witness's
+pubkey. The cost is one extra round-trip per new node; the benefit is
+that **every node ever recorded at the witness has demonstrated
+src_ip ownership**.
 
 ### 13.2 Steady state
 
@@ -776,34 +911,45 @@ membership.
 ### 13.3 Witness reboot
 
 ```
-Witness loses all state.
+Witness loses all state, including witness_cookie_secret(s).
 
-Each node's next HEARTBEAT → UNKNOWN_SOURCE (witness has no entries).
-Each node BOOTSTRAPs.
-First BOOTSTRAP installs the cluster; subsequent BOOTSTRAPs are
-idempotent (status=0x01).
+Each node's next HEARTBEAT → INIT (witness has no entries; fresh cookie).
+Each node BOOTSTRAPs with the fresh cookie.
+First BOOTSTRAP per cluster_key installs the cluster; subsequent
+BOOTSTRAPs are idempotent (status=0x01).
 ```
 
 ### 13.4 Node IP change
 
 ```
 Node A's DHCP lease changes IP.
-A → witness: HEARTBEAT from new IP, encrypted under K.
-witness's IP-first lookup misses (new IP).
-witness's sender_id-only fallback finds A's entry; AEAD verifies.
-witness updates A's stored sender_ipv4.
+A → witness: HEARTBEAT from new src_ip, encrypted under K.
+witness's strict (src_ip, sender_id) lookup misses (no entry under
+            new src_ip).
+witness → A: INIT (with cookie bound to A's new src_ip).
+A → witness: BOOTSTRAP (cluster_key K, cookie).
+witness validates cookie + AEAD, finds A's existing entry by
+            (sender_id, K), updates sender_ipv4 = new src_ip.
+            status=0x01 (idempotent re-bootstrap).
 Subsequent peers see A's new IP in their next STATUS_DETAIL queries.
 ```
+
+A pure HEARTBEAT-based IP transfer is no longer permitted. This costs
+two extra round-trips on a DHCP renewal (a rare event in practice; many
+clients pin to the same IP for the lease lifetime), and it closes the
+off-path attack where a spoofed-source HEARTBEAT could redirect a
+victim's stored sender_ipv4 to an attacker-controlled address.
 
 ### 13.5 Discovery flow (operator dashboard)
 
 ```
 Dashboard has list of candidate witness addresses.
 For each address:
-  Dashboard → witness: DISCOVER
-  witness → Dashboard: UNKNOWN_SOURCE (with witness_pubkey)
+  Dashboard → witness: DISCOVER (62 B, zero-padded)
+  witness → Dashboard: INIT (witness_pubkey + cookie)
   Dashboard verifies pubkey against DNSSEC TXT or other trust source.
   Dashboard records (address, pubkey) for operator review.
+  (Cookie is discarded — discovery does not BOOTSTRAP.)
 ```
 
 ---
@@ -845,9 +991,9 @@ v1 ships these vectors:
 | `05_status_list_empty.{json,bin}`           | STATUS_LIST, 0 entries |
 | `06_status_detail_found.{json,bin}`         | STATUS_DETAIL with peer found, 4-block peer_payload |
 | `07_status_detail_not_found.{json,bin}`     | STATUS_DETAIL not-found |
-| `08_discover.{json,bin}`                    | DISCOVER |
-| `09_unknown_source.{json,bin}`              | UNKNOWN_SOURCE with pubkey |
-| `10_bootstrap.{json,bin}`                   | BOOTSTRAP (fixed eph_secret + cluster_key) |
+| `08_discover.{json,bin}`                    | DISCOVER (62 B, zero-padded) |
+| `09_init.{json,bin}`                        | INIT with pubkey + cookie |
+| `10_bootstrap.{json,bin}`                   | BOOTSTRAP (fixed eph_secret + cluster_key + cookie) |
 | `11_bootstrap_ack_new.{json,bin}`           | BOOTSTRAP_ACK status=0x00 |
 | `12_bootstrap_ack_rebootstrap.{json,bin}`   | BOOTSTRAP_ACK status=0x01 |
 
@@ -900,7 +1046,18 @@ No specific extension is committed to in v1.
   cluster.
 - Replay rejection: strict-monotonic timestamp_ms per sender; receiver-
   side `last_rx_timestamp` tracking.
-- Anti-DDoS: per-source-IP token bucket; UNKNOWN_SOURCE rate limit.
+- Anti-DDoS: per-source-IP token bucket; INIT rate limit.
+- Anti-amplification: DISCOVER (62 B) ≥ INIT reply (62 B). The witness
+  cannot be turned into a UDP amplifier — the reply is never larger than
+  the request.
+- Anti-spoofing on BOOTSTRAP: DNS-style cookies bind BOOTSTRAP to a
+  src_ip the sender can actually receive packets at. An off-path
+  attacker cannot forge a BOOTSTRAP for a victim's IP. (See §11.2.)
+- Strict (src_ip, sender_id) match on steady-state HEARTBEATs: an
+  attacker spoofing a victim's IP cannot hijack or modify an existing
+  node entry's stored payload via a forged HEARTBEAT, because the
+  witness drops anything that doesn't match the (src_ip, sender_id) it
+  recorded at BOOTSTRAP. (See §13.4.)
 
 **Out of scope / known limitations:**
 - **No forward secrecy** for cluster_key against compromise of
@@ -917,9 +1074,14 @@ No specific extension is committed to in v1.
   needs externally-verifiable witness output (audit logs, cross-org
   attestations), a v2 message type with Ed25519 (or PQ-sig) signature
   trailer can be added.
-- **DISCOVER and UNKNOWN_SOURCE are unauthenticated by necessity.**
+- **DISCOVER and INIT are unauthenticated by necessity.**
   Trust in the witness's pubkey comes from out-of-band channels (DNSSEC
-  TXT, operator config, TOFU + human verification).
+  TXT, operator config, TOFU + human verification). The cookie in INIT
+  is a binding to src_ip, not an authentication of the witness — a
+  spoofed INIT from an attacker's witness can include a forged cookie,
+  but a real BOOTSTRAP using such a cookie will fail when the
+  attacker's witness can't decrypt the cluster_key (because they don't
+  have the matching X25519 secret).
 
 ---
 

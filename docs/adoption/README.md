@@ -47,8 +47,8 @@ Python/shell daemon, manual admin).
 
 **What Echo adds:**
 
-- Node-level liveness: "is peer alive or dead?" with HMAC-authenticated
-  answer and optional 128-byte peer state.
+- Node-level liveness: "is peer alive or dead?" with AEAD-authenticated
+  answer and optional opaque peer state (up to 1152 bytes per node).
 - 128-byte payload carries per-resource DRBD UUID + role bitmap.
 - Advertise-verify-act before `drbdadm primary` → the witness has a
   durable record of "I intend to be Primary of bec-r0" before the
@@ -131,48 +131,184 @@ order of every few seconds; Echo can match that easily at 3 s/heartbeat.
 
 ---
 
-## Raft family (etcd, RQlite, Consul, CockroachDB)
+## Raft family (etcd, RQlite, Consul, CockroachDB, and Bedrock itself)
 
-**How it already works:** Raft requires ≥ 3 voting members for
-fault-tolerance. Odd counts only (to avoid split votes). With 3 members,
-1 can fail; with 5, 2 can fail. In 2-DC deployments, a 5-node cluster
-typically runs 3 in DC-A and 2 in DC-B; losing DC-A → minority → stall.
+Raft is the motivating model for Bedrock's own clustering, so this
+section goes deeper than the others.
 
-**What Echo could be used for:**
+**Important layer separation:** Echo's `sender_id` (1 byte) is the
+witness-lookup identity, not Raft's internal `member_id`. Raft's
+member_id (u64 in etcd, UUID in Consul, arbitrary in others) is
+application-level and lives inside Echo's `own_payload`. The two
+layers are independent — a Raft cluster can assign Echo sender_ids
+1..N for its N members while keeping whatever internal member IDs
+Raft itself uses.
 
-- **Lightweight "non-voting follower" role**: not a Raft voter, but a
-  durable external checkpoint. Periodically, the current leader sends
-  a heartbeat containing `{term, last_applied_index, leader_id}`.
-- **Recovery after total cluster outage**: the first node to boot can
-  query the witness for each peer's last known state. Among the peers,
-  the one with the highest `last_applied_index` has the most
-  up-to-date log. That node should be the leader candidate in the
-  recovering quorum.
+### Echo's role for Raft: external checkpoint + liveness oracle
 
-**What Echo would NOT do:** vote in Raft elections. Raft requires
-voters to actually participate in log replication, which our witness
-doesn't. Attempting to add the witness as a Raft voter would break
-Raft's safety properties.
+Echo is *not* a Raft voter. Raft's safety properties depend on
+voters participating in log replication, which the witness doesn't.
+Echo sits *outside* the voting ring, providing evidence that Raft
+didn't have before.
 
-**Suggested 128 B payload:**
+### Use case 1 — Classic 3-site DR
 
 ```
-u8     raft_role                 //  1 B; 0=follower, 1=candidate, 2=leader
-u8     reserved[3]               //  3 B
-u64    current_term              //  8 B
-u64    last_log_index            //  8 B
-u64    last_applied_index        //  8 B
-u8     voted_for_node_id[8]      //  8 B
-u8     leader_id[8]              //  8 B (zero if unknown)
-u8     reserved2[8]              //  8 B
-u8     cluster_id_hash[32]       // 32 B; SHA-256 of membership config
-u8     reserved3[44]             // 44 B padding
+    Site A                Site B              Site C (witness)
+  ┌────────┐           ┌────────┐            ┌─────────┐
+  │ R-node1│           │ R-node3│            │ Echo    │
+  │ R-node2│───Raft────│ R-node4│─────UDP────│ witness │
+  └────────┘           └────────┘            └─────────┘
+        └─────UDP to Echo───┘                     │
+        └─────UDP to Echo──────────────────────────┘
 ```
 
-**Benefit for 2-DC scenarios:** split DCs at 3+2; DC-B survivor queries
-the Echo witness in a third location, sees "DC-A last reported term=5
-index=1000, now silent for 2 minutes", and can start a forced
-reconfiguration safely knowing DC-A was not ahead.
+Every Raft node heartbeats Echo every 2s with its current
+`{term, commit_index, last_log_index, state_hash}`. On site
+partition, the surviving site's nodes query Echo for the isolated
+site's last state:
+
+- `peer.commit_index ≤ ours` → no committed-log-divergence possible,
+  safe to continue serving.
+- `peer.commit_index > ours` → peer had committed entries we don't
+  have, UNSAFE, refuse writes, escalate.
+
+This is a **crash-consistent external checkpoint** that Raft lacks
+on its own. Raft traditionally has to assume-the-worst about
+partitioned nodes; with Echo, it can verify.
+
+### Use case 2 — Recovery after total cluster outage
+
+Full multi-site power loss. Witness (battery-backed) retains state.
+Raft nodes come back in staggered order. First node back:
+
+1. Queries Echo for each known peer's last state.
+2. For each peer, sees `term, commit_index, last_seen_ms, state_hash`.
+3. Decision per Appendix A §A.5 of PROTOCOL.md:
+   - Any peer with `commit_index > mine` → UNSAFE to lead; wait.
+   - Peer with `commit_index == mine` and same `state_hash` → we're
+     converged at peer's last checkpoint; safe to hold election once
+     a second node joins.
+   - All peers with `commit_index < mine` or no record → we're ahead
+     or peer is permanently lost; proceed through normal recovery.
+
+This works *because* Echo stored the full Raft state fingerprint in
+`own_payload`. Pure liveness info wouldn't be enough.
+
+### Use case 3 — Asymmetric partition detection
+
+Raft's internal failure detector is peer-to-peer heartbeats. If
+A↔B fails but A→C works fine, B times A out locally but A still
+thinks it's alive. Raft can't disambiguate "A dead" from "A
+partitioned from B only."
+
+With Echo, B queries `STATUS_DETAIL(A.sender_id)` and sees A's
+`last_seen_ms` from the witness's perspective:
+
+- Small `last_seen_ms` → A is alive but can't reach B (network
+  partition A↔B).
+- Large `last_seen_ms` → A is either dead or partitioned from both
+  B and the witness.
+
+Enables smarter daemon-layer decisions: route requests via alternate
+paths, proactively step down leadership, log meaningful alerts.
+
+### Use case 4 — 2-node Raft + Echo-as-oracle (the surprising one)
+
+Bare 2-node Raft deadlocks on leader election — neither has majority
+for its own vote. Workarounds (learners, external lease managers,
+static primary assignment) are all awkward.
+
+Echo doesn't vote, so it doesn't directly solve this. But a daemon
+layer can use Echo as an oracle:
+
+```
+On peer-unreachable timeout:
+  query Echo for peer's STATUS_DETAIL(sender_id=peer)
+  if peer.last_seen_ms < 10_000:      # peer alive, just partitioned from me
+    do NOT promote; we're split-brain candidates
+  else:                                # peer presumed dead
+    advertise-verify-act via Echo (PROTOCOL.md Appendix A)
+    if verification succeeds:
+      promote self to leader, resume writes
+```
+
+This makes 2-node Raft-like clusters actually workable for small
+deployments. The promotion is gated by Echo's durable evidence that
+no split-brain is active.
+
+### What Echo does NOT change in Raft
+
+- Quorum math untouched. 3-node Raft still needs 2 of 3 for commits;
+  5-node needs 3 of 5.
+- Log replication untouched. Raft still does AppendEntries directly
+  between nodes.
+- Term numbering untouched. Nodes pick their own terms.
+- Member management untouched. Raft conf changes happen via Raft's
+  own ConfChange mechanism.
+
+Echo adds *external evidence*; Raft's internal mechanics are
+unchanged.
+
+### Suggested payload schema for Raft-over-Echo
+
+Fits in 128 B (leaves 1024 B of the 1152 B payload cap for future
+extensions — signatures, Merkle proofs, peer attestations):
+
+```
+Offset  Size  Field                    Notes
+──────────────────────────────────────────────────────────
+0       8     raft_member_id           u64 (Raft's internal ID)
+8       1     raft_role                0=follower, 1=candidate,
+                                        2=leader, 3=learner
+9       7     reserved                 align to u64 boundary
+16      8     current_term             u64
+24      8     voted_for_member         u64 (0 if none this term)
+32      8     last_log_index           u64
+40      8     last_log_term            u64
+48      8     commit_index             u64
+56      8     last_applied             u64
+64      32    state_machine_root       [u8; 32] — Merkle/hash
+96      32    log_tip_hash             [u8; 32] — hash of last N entries
+──────────────────────────────────────────────────────────
+Total: 128 bytes (expandable to 1152)
+```
+
+### Implementation sketch
+
+1. **Raft node daemon** (one per Raft member):
+   - Maintains its Raft member state locally (existing).
+   - Runs an Echo node client with assigned sender_id (1..N within
+     cluster).
+   - Bootstraps the Echo session at startup.
+   - Every 2 s: heartbeats Echo with `own_payload = current Raft
+     state snapshot`. Uses STATUS_DETAIL to query a specific peer
+     when needed (failure detection, recovery decision).
+
+2. **Raft cluster config** adds Echo fields:
+   ```yaml
+   raft:
+     member_id: 0xf7c3a82e6414e63a
+     peers: [...]
+   echo:
+     sender_id: 3                         # 1..N, unique in this cluster
+     cluster_key: <32B from provisioning>
+     witness_pubkeys:                     # list for HA
+       - { addr: witness-a.example:12321, pubkey: <32B> }
+       - { addr: witness-b.example:12321, pubkey: <32B> }
+       - { addr: witness-c.example:12321, pubkey: <32B> }
+   ```
+
+3. **Recovery decision module** consults Echo before any forced
+   reconfiguration or 2-node promotion. Safety comes from the
+   advertise-verify-act pattern.
+
+### Bedrock's own clustering
+
+Bedrock's planned distributed behavior is Raft-inspired. Echo is
+Bedrock's witness. The 4 use cases above apply directly to Bedrock.
+See `docs/bedrock-cluster-log.md` for the hash-chained log design
+and Appendix A of PROTOCOL.md for the safety pattern.
 
 ---
 

@@ -58,12 +58,7 @@ final-review).
    `let pubkey = state.witness_pub;` before the encode call. Pattern
    is now consistent throughout the test file.
 
-2. **Stale generator helper** in `python/tools/gen_testvectors.py` —
-   pre-polish dead code referencing `proto.UnknownSource(sender_id=...,
-   sequence=...)` that doesn't match the API. Not a runtime bug
-   (unused), but worth cleaning up in a future tidy commit.
-
-3. **Spec internal consistency.** The §1 design-principles list grew
+2. **Spec internal consistency.** The §1 design-principles list grew
    from 12 items to 14 (added anti-amp + anti-spoof principles).
    Cross-references to the renamed INIT message updated everywhere
    except the historical phase-review docs (which describe what was

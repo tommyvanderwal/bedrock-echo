@@ -202,7 +202,7 @@ battle-tested platform rather than rolling our own TCP/IP and RTOS.
 
 ### If smaller matters later
 
-Low-hanging 100+ KB reductions available but not done for v0.001:
+Low-hanging 100+ KB reductions available but not done yet:
 
 - Drop printf (`CONFIG_NEWLIB_NANO_FORMAT=y`) → saves ~15 KB of newlib.
 - Prune mbedTLS to only HMAC-SHA256 + ChaCha20-Poly1305 (disable AES,

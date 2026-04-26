@@ -51,11 +51,11 @@ class Resource:
 class Config:
     node_name: str
     peer_name: str
-    sender_id: bytes          # 8 bytes
-    peer_sender_id: bytes     # 8 bytes
+    sender_id: int            # 0x00..0xFE  (PROTOCOL.md §2)
+    peer_sender_id: int       # 0x00..0xFE
     cluster_key: bytes        # 32 bytes
     witness_addr: tuple[str, int]
-    witness_x25519_pub: bytes # 32 bytes
+    witness_pubkey: bytes     # 32 bytes — the witness's X25519 public key
     # All of {mgmt_ip, drbd_ip, link2_ip} are the PEER's addresses on each ring.
     peer_rings: list[str]
     resources: list[Resource]
@@ -83,7 +83,7 @@ class Daemon:
             sender_id=self.cfg.sender_id,
             cluster_key=self.cfg.cluster_key,
             witness_addr=self.cfg.witness_addr,
-            witness_x25519_pub=self.cfg.witness_x25519_pub,
+            witness_pubkey=self.cfg.witness_pubkey,
         )
 
     def tick(self, now: float) -> None:
@@ -189,12 +189,16 @@ class Daemon:
 
     def _describe_self(self) -> bytes:
         """Compact opaque payload describing our DRBD state. The witness stores
-        this verbatim and serves it to the peer on STATUS_DETAIL. Up to 128 B."""
+        this verbatim and serves it to the peer on STATUS_DETAIL. Block-
+        granular per PROTOCOL.md §4.1: pad to a 32 B multiple, cap at 1152 B."""
         parts = []
         for r in self.cfg.resources:
             parts.append(f"{r.drbd_resource}:{self.drbd.role(r.drbd_resource)}")
         payload = ",".join(parts).encode()
-        return payload[:proto.NODE_PAYLOAD_MAX]
+        # Cap, then round up to a 32-byte block boundary with zero padding.
+        payload = payload[:proto.PAYLOAD_MAX_BYTES]
+        pad = (-len(payload)) % proto.PAYLOAD_BLOCK_SIZE
+        return payload + b"\x00" * pad
 
     def _peer_reachable_anywhere(self) -> tuple[bool, Optional[str]]:
         for ring in self.cfg.peer_rings:
@@ -210,11 +214,11 @@ class Daemon:
         except Exception as e:
             log.debug("witness unreachable: %s", e)
             return None
-        if sd.status != 0x00:
+        if not sd.found:
             # Witness doesn't know the peer — treat as dead (never seen or aged out).
             return {"alive": False, "last_seen_s": None}
-        alive = sd.last_seen_seconds <= WITNESS_TIMEOUT_S
-        return {"alive": alive, "last_seen_s": sd.last_seen_seconds}
+        last_seen_s = sd.peer_seen_ms_ago / 1000.0
+        return {"alive": last_seen_s <= WITNESS_TIMEOUT_S, "last_seen_s": last_seen_s}
 
     def _takeover(self) -> None:
         log.warning("QUORUM (self+witness) — initiating takeover")

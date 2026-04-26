@@ -20,9 +20,20 @@ serves it back on request.
 The witness can be an ESP32 on a desk, a 700 KB static binary in an AWS
 region, a container on a MikroTik router, or anything in between.
 
-**Status:** Beta. Wire format frozen pending external implementer
-feedback. Three reference implementations agree byte-for-byte via 12
-canonical test vectors. Live cross-language interop verified.
+**Protocol status: Draft v0.x.**
+
+The current wire format is stable enough for interoperability testing,
+but not frozen. Breaking changes may still happen before v1.0 based on
+implementation feedback, security review, and BedRock integration
+testing. Three reference implementations agree byte-for-byte via 12
+canonical test vectors, and live cross-language interop is verified —
+but until BedRock has run on top of Echo in production for a while,
+the wire is open to change.
+
+If you're considering a fourth implementation: now is the moment to
+review and push back. Once v1.0 ships into hardware that's never going
+to be touched again, the wire is immutable forever (different
+protocols thereafter use different UDP ports, not new Echo versions).
 
 
 ## What's in the repo
@@ -195,11 +206,13 @@ their own.
 
 ## Contributing / Implementer feedback
 
-Echo is in **beta** specifically to invite review by external implementers
-before any wire-format gets shipped into hardware that's never touched
-again. If you're writing a fourth implementation (Go, Java, Swift, Zig, …)
-and something in `PROTOCOL.md` is ambiguous or implementation-hostile,
-please open an issue.
+Echo is in **draft (v0.x)** specifically to invite review by external
+implementers before any wire-format gets shipped into hardware that's
+never touched again. If you're writing a fourth implementation (Go,
+Java, Swift, Zig, …) and something in `PROTOCOL.md` is ambiguous or
+implementation-hostile, please open an issue. Wire-format change
+proposals are still on the table — the threshold for "we should change
+this" is much lower right now than it will be after v1.0.
 
 The 12 test vectors and 137 tests across the existing implementations
 (99 Python + 30 Rust + 8 cross-language live) are the regression net. A

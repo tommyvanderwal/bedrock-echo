@@ -1,8 +1,17 @@
 # Bedrock Echo Protocol
 
-**Status:** Frozen. Once implementations start shipping on firmware that goes
-into boxes we will never touch again, changes to this spec are forbidden. A
-genuinely different protocol ships on a different UDP port, not a new version.
+**Status: Draft v0.x.** The current wire format is stable enough for
+interoperability testing — three reference implementations agree
+byte-for-byte via 12 canonical test vectors — but not frozen. Breaking
+changes may still happen before v1.0 based on implementation feedback,
+security review, and BedRock integration testing.
+
+Once v1.0 is reached, the wire format becomes immutable: the protocol
+is named "Echo" with no version field, and a genuinely different
+protocol ships on a different UDP port (not a new version of Echo).
+The "v0.x → v1.0" labelling exists only on this document during the
+draft phase; the wire itself has never carried a version byte and
+never will.
 
 **Transport:** UDP, default port **12321** (configurable by deployment; the
 port number is not part of the protocol itself).

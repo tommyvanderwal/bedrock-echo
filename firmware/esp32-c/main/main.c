@@ -5,6 +5,7 @@
 #include "echo.h"
 #include "echo_eth.h"
 #include "echo_info.h"
+#include "echo_mdns.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -160,12 +161,17 @@ void app_main(void) {
     ESP_LOGI(TAG, "waiting for DHCP ...");
     xEventGroupWaitBits(s_net_events, GOT_IPV4_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
 
-    // 4. UDP task.
+    // 4. mDNS — advertise _echo._udp on the LAN. Best-effort; failures
+    //    don't prevent the witness from running, just from being
+    //    auto-discovered.
+    echo_mdns_announce(&g_state);
+
+    // 5. UDP task.
     xTaskCreate(udp_server_task, "echo-udp", 8192, NULL, 5, NULL);
 
     ESP_LOGI(TAG, "witness ready.");
 
-    // 5. Print the provisioning info block (pub / senderid / MAC / IP)
+    // 6. Print the provisioning info block (pub / senderid / MAC / IP)
     //    and start a tiny console that re-prints it on any serial input.
     echo_info_print(&g_state, netif);
     echo_info_start_console(&g_state, netif);

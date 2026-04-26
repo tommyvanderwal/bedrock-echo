@@ -530,13 +530,82 @@ Operator copies pubkey from witness's serial console output (printed
 on first boot, persistent in NVS) into cluster config. INIT
 serves as a "are these the same key?" sanity check.
 
-### 6.4 Provisioning vs. discovery
+### 6.4 LAN auto-discovery via mDNS / DNS-SD (RECOMMENDED on LAN)
 
-These three patterns are not mutually exclusive. A typical hosted
+For pure-LAN deployments (DHCP'd ESP32 witness on a small office or
+homelab network, container witness on a MikroTik router) the witness
+SHOULD advertise itself via mDNS / DNS-SD (RFC 6762/6763) so operators
+can find it without prior configuration.
+
+**Service convention:**
+```
+hostname:    bedrock-echo-witness.local.
+service:     _echo._udp.local.
+port:        12321 (or whatever the witness binds)
+TXT records: v=Echo
+             k=x25519
+             p=<BASE64 of 32 B X25519 pubkey>     (44 chars)
+```
+
+The TXT format is **identical to the DNSSEC-hosted scheme in §6.1**.
+A single parser handles both transports.
+
+**Discovery paths the operator gets for free:**
+
+```
+ping bedrock-echo-witness.local              # casual, any OS with mDNS
+avahi-browse -tr _echo._udp                  # Linux
+dns-sd -B _echo._udp                         # macOS
+python -m zeroconf browse _echo._udp.local.  # any OS, any toolkit
+```
+
+A Bedrock console can use the standard zeroconf libraries (Python
+`zeroconf`, Rust `mdns-sd`, Go `dnssd`) to enumerate witnesses on the
+LAN and present a picker to the operator with the IP, port, and
+claimed pubkey from the TXT.
+
+**Trust model — important:**
+
+mDNS on LAN is unauthenticated. Anyone on the same broadcast domain
+can advertise a fake `_echo._udp` service with a forged pubkey. The
+TXT pubkey is therefore a **UX convenience, not a trust anchor**.
+
+The trust still flows through the operator verifying the witness's
+pubkey against an out-of-band source (the serial-console print at
+first boot, or the value in cluster config). The "found via mDNS,
+verified pubkey out-of-band" pattern is the same security posture as
+"found via DNSSEC TXT, verified pubkey via DNSSEC chain" — only the
+authentication channel differs.
+
+For paranoid deployments where any LAN-actor has spoofing capability
+that matters, disable the announce (`BEDROCK_ECHO_MDNS=0` env var on
+the Rust witness; `idf.py menuconfig` toggle on the ESP32 firmware)
+and use §6.2 config-management distribution exclusively.
+
+**Cost:**
+
+- Wire: 3–5 multicast packets of ~350 B at boot (RFC 6762 §8 announce
+  burst), one ~350 B re-announce every 30–60 minutes thereafter, and
+  one reactive reply per query. Negligible vs. typical LAN noise.
+- Confined to the L2 broadcast domain (TTL=1); does not cross routers
+  or leave the LAN.
+- Code: ~80 LoC in the ESP32 firmware (espressif/mdns component); ~50
+  LoC in the Rust witness (`mdns-sd` crate).
+
+**MikroTik container note:** when running the witness in a RouterOS
+container, attach the container's veth into the LAN bridge so mDNS
+multicast reaches the LAN clients. Verify `igmp-snooping` on the
+bridge is either off or correctly configured with a querier; otherwise
+multicast frames may be filtered.
+
+### 6.5 Provisioning vs. discovery
+
+The four patterns above are not mutually exclusive. A typical hosted
 deployment uses §6.1 (DNS-published pubkeys) for first-time
 discovery and ongoing verification, while §6.2 (config-management)
 might also push the resolved pubkey to nodes for offline-capable
-operation.
+operation. A LAN deployment uses §6.4 (mDNS) for discovery + §6.3
+(serial-console pubkey) for trust.
 
 ---
 

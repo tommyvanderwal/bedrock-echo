@@ -7,5 +7,8 @@
 pub mod handler;
 pub mod state;
 
+#[cfg(feature = "mdns")]
+pub mod mdns;
+
 pub use handler::{handle, Reply};
 pub use state::State;

@@ -9,6 +9,13 @@ description = "Bedrock Echo witness — Linux UDP binary"
 bedrock-echo-proto = { path = "../bedrock-echo-proto" }
 rand_core = { version = "0.6", features = ["std", "getrandom"] }
 heapless = "0.8"
+# Pure-Rust mDNS-SD implementation. Used by the bin to advertise
+# `_echo._udp.local.` so operators on the same LAN can find the
+# witness via standard tooling (avahi-browse / dns-sd / zeroconf).
+mdns-sd = { version = "0.13", default-features = false, optional = true }
+# base64 encoding for the pubkey field in the mDNS TXT record.
+base64 = { version = "0.22", optional = true }
 
 [features]
-default = []
+default = ["mdns"]
+mdns = ["dep:mdns-sd", "dep:base64"]

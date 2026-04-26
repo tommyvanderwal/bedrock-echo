@@ -1,0 +1,7 @@
+## IDF Component Manager dependencies for the Bedrock Echo witness firmware.
+## Declared here so `idf.py build` resolves the mDNS component automatically
+## via component-manager. Pin to a major-version line so we don't get
+## breaking-API surprises on rebuild.
+
+dependencies:
+  espressif/mdns: "^1.2.0"

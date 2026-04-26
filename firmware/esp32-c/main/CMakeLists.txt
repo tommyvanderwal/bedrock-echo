@@ -8,6 +8,7 @@ idf_component_register(
         "echo_eth.c"
         "echo_info.c"
         "echo_key.c"
+        "echo_mdns.c"
     INCLUDE_DIRS "."
     REQUIRES
         esp_eth
@@ -17,6 +18,7 @@ idf_component_register(
         lwip
         mbedtls
         driver
+        mdns
     PRIV_REQUIRES
         esp_timer
         bootloader_support

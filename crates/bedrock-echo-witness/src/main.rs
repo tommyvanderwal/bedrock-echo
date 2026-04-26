@@ -81,6 +81,27 @@ fn main() {
     eprintln!("  witness pub:    {}", hex_encode(&state.witness_pub));
 
     let sock = UdpSocket::bind(bind).expect("bind UDP socket");
+
+    // Optional LAN mDNS announce. Default ON; disable with
+    // `BEDROCK_ECHO_MDNS=0`. Stored so the daemon stays alive for the
+    // process lifetime — drop unregisters cleanly on shutdown.
+    #[cfg(feature = "mdns")]
+    let _mdns = if std::env::var("BEDROCK_ECHO_MDNS").as_deref() != Ok("0") {
+        match bedrock_echo_witness::mdns::announce(bind.ip(), bind.port(), &state.witness_pub) {
+            Ok(h) => {
+                eprintln!("  mdns:           advertising _echo._udp as bedrock-echo-witness.local");
+                Some(h)
+            }
+            Err(e) => {
+                eprintln!("  mdns:           failed ({}), continuing without LAN announce", e);
+                None
+            }
+        }
+    } else {
+        eprintln!("  mdns:           disabled via BEDROCK_ECHO_MDNS=0");
+        None
+    };
+
     let mut buf = [0u8; MTU_CAP + 64];
     loop {
         match sock.recv_from(&mut buf) {

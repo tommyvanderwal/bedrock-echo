@@ -46,7 +46,7 @@ protocols thereafter use different UDP ports, not new Echo versions).
 | [`docs/adoption/`](docs/adoption/)    | How to integrate Echo into specific cluster systems (DRBD, Raft, …) |
 | [`docs/phase-reviews/`](docs/phase-reviews/) | The implementation journey, with thoughts and doubts |
 | `python/echo/`                        | Python reference implementation (proto + node + witness)          |
-| `python/tests/`                       | 99 unit/integration/end-to-end tests                              |
+| `python/tests/`                       | 101 unit/integration/end-to-end tests                             |
 | `crates/bedrock-echo-proto/`          | Rust `no_std` protocol library                                    |
 | `crates/bedrock-echo-witness/`        | Rust witness binary (Linux / container) — 791 KB static-musl      |
 | `firmware/esp32-c/`                   | ESP32-IDF C firmware (Olimex ESP32-POE-ISO)                       |
@@ -57,7 +57,7 @@ protocols thereafter use different UDP ports, not new Echo versions).
 
 | Implementation | Language | Target | Tests | LOC |
 |---|---|---|---:|---:|
-| Reference   | Python (`cryptography`) | any | 99 | ~1.5 K |
+| Reference   | Python (`cryptography`) | any | 101 | ~1.5 K |
 | Witness     | Rust (`x25519-dalek`, `chacha20poly1305`) | Linux x86_64 / aarch64, container, embeddable as `no_std` | 30 | ~1.8 K |
 | Firmware    | C (TweetNaCl + mbedTLS, ESP-IDF) | ESP32-POE-ISO and similar | live boot | ~2.2 K |
 
@@ -81,10 +81,23 @@ Python ↔ Rust interop is exercised over real LAN UDP in
   pattern). Strict `(src_ip, sender_id)` match on heartbeats blocks
   off-path injection.
 - **Anti-amplification.** DISCOVER pads to match the INIT reply size
-  (62 B → 62 B); the witness can never be used as a UDP reflector.
-- **No protocol version field.** The magic is `Echo`, forever. Different
-  protocols ship on different UDP ports — old firmware in the wild keeps
-  working.
+  (64 B → 64 B); the witness can never be used as a UDP reflector.
+- **No protocol version field — and none needed.** The magic is `Echo`,
+  forever. Forward-compat lives in two extension points that grow
+  gracefully:
+  - **`capability_flags`** — a 16-bit field in DISCOVER and INIT.
+    Current senders zero it; future senders set bits to advertise new
+    features (post-quantum bootstrap, IPv6 status types, …). Receivers
+    MUST ignore bits they don't recognise.
+  - **Unallocated `msg_type` values** — entirely new flows can be added
+    later. Receivers silent-drop unknown types.
+
+  **All extensions are backwards compatible with original clients.**
+  Old firmware in the wild keeps working when the protocol grows; no
+  version negotiation, no breaking upgrades, no firmware-in-the-wild
+  failure mode. (Genuinely incompatible *different* protocols ship on
+  a different UDP port with a different name — never as a "version 2"
+  of Echo.)
 - **RAM-only state at the witness.** Reboot loses cluster state by design;
   nodes re-bootstrap as part of normal recovery.
 - **Block-granular payloads** (32 B blocks, 0..1152 B per node) align with
@@ -150,8 +163,8 @@ config and supply the trust-anchor pubkey).
 | `0x01`   | HEARTBEAT      | node → witness  | AEAD     | 32 + 32N B  |
 | `0x02`   | STATUS_LIST    | witness → node  | AEAD     | 35 + 5N B   |
 | `0x03`   | STATUS_DETAIL  | witness → node  | AEAD     | 36 / 44+32N B |
-| `0x04`   | DISCOVER       | node → witness  | none     | 62 B        |
-| `0x10`   | INIT           | witness → node  | none     | 62 B        |
+| `0x04`   | DISCOVER       | node → witness  | none     | 64 B        |
+| `0x10`   | INIT           | witness → node  | none     | 64 B        |
 | `0x20`   | BOOTSTRAP      | node → witness  | AEAD-DH  | 110 B       |
 | `0x21`   | BOOTSTRAP_ACK  | witness → node  | AEAD     | 35 B        |
 
@@ -167,7 +180,7 @@ strict-monotonic `timestamp_ms` per sender. See
 # Python reference impl + vectors + state machine + e2e UDP-loopback
 PYTHONPATH=python python3 -m pytest python/tests/ \
     --ignore=python/tests/test_interop_live.py
-# 99 passed
+# 101 passed
 
 # Rust impl + 12 cross-language vectors + state machine
 cargo test
@@ -214,9 +227,9 @@ implementation-hostile, please open an issue. Wire-format change
 proposals are still on the table — the threshold for "we should change
 this" is much lower right now than it will be after v1.0.
 
-The 12 test vectors and 137 tests across the existing implementations
-(99 Python + 30 Rust + 8 cross-language live) are the regression net. A
-fresh implementation that passes all 12 vectors byte-exactly is, by
+The 12 test vectors and 139 tests across the existing implementations
+(101 Python + 30 Rust + 8 cross-language live) are the regression net.
+A fresh implementation that passes all 12 vectors byte-exactly is, by
 construction, on the wire-compatible path.
 
 

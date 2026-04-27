@@ -207,31 +207,36 @@ def main():
     }
     write_pair("07_status_detail_not_found", inputs, sd_nf.encode(CLUSTER_KEY))
 
-    # 08: DISCOVER (62 B, zero-padded for anti-amplification)
-    disc = proto.Discover(sender_id=NODE_A_ID, timestamp_ms=TS_DISCOVER)
+    # 08: DISCOVER (64 B, zero-padded for anti-amplification, caps=0)
+    disc = proto.Discover(sender_id=NODE_A_ID, timestamp_ms=TS_DISCOVER,
+                          capability_flags=0)
     inputs = {
-        "description": "DISCOVER probe (62 B, zero-padded so request size == INIT reply size)",
+        "description": "DISCOVER probe (64 B). 14 B header + 2 B caps + 48 B zero pad. "
+                       "Caps default 0 in Draft v0.x.",
         "msg_type": "0x04 DISCOVER",
         "sender_id": NODE_A_ID,
         "timestamp_ms": TS_DISCOVER,
+        "capability_flags": 0,
         "padding_bytes": 48,
     }
     write_pair("08_discover", inputs, disc.encode())
 
-    # 09: INIT with witness_pubkey + cookie
+    # 09: INIT with witness_pubkey + cookie + caps=0
     init = proto.Init(
         timestamp_ms=TS_WITNESS_REPLY + 4,
         witness_pubkey=WITNESS_PUB,
         cookie=BOOTSTRAP_COOKIE,
+        capability_flags=0,
     )
     inputs = {
-        "description": "INIT reply carrying witness_pubkey and the anti-spoof cookie for src_ip",
+        "description": "INIT reply (64 B): pubkey + cookie + 16-bit witness capability_flags",
         "msg_type": "0x10 INIT",
         "timestamp_ms": TS_WITNESS_REPLY + 4,
         "witness_pubkey": hexstr(WITNESS_PUB),
         "witness_cookie_secret": hexstr(WITNESS_COOKIE_SECRET),
         "src_ip": ".".join(str(b) for b in BOOTSTRAP_SRC_IP),
         "cookie": hexstr(BOOTSTRAP_COOKIE),
+        "capability_flags": 0,
     }
     write_pair("09_init", inputs, init.encode())
 

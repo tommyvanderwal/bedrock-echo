@@ -49,12 +49,18 @@
 #define ECHO_WITNESS_COOKIE_SECRET_LEN 32u
 #define ECHO_COOKIE_ROTATION_MS (3600u * 1000u)  // 1 hour
 
+// Forward-compat capability_flags in DISCOVER + INIT (PROTOCOL.md §16.2).
+// 16 bits at offset 14 in both messages. Senders in the current draft
+// MUST set all bits to 0; receivers MUST NOT reject on non-zero.
+#define ECHO_CAPS_LEN 2u
+
 // DISCOVER zero-padding (anti-amp; PROTOCOL.md §1 principle 13, §5.4)
 #define ECHO_DISCOVER_PAD_LEN 48u
 
 // Total fixed-size packets
-#define ECHO_DISCOVER_LEN (ECHO_HEADER_LEN + ECHO_DISCOVER_PAD_LEN)  // 62
-#define ECHO_INIT_LEN (ECHO_HEADER_LEN + ECHO_WITNESS_PUBKEY_LEN + ECHO_COOKIE_LEN)  // 62
+#define ECHO_DISCOVER_LEN (ECHO_HEADER_LEN + ECHO_CAPS_LEN + ECHO_DISCOVER_PAD_LEN)  // 64
+#define ECHO_INIT_LEN \
+    (ECHO_HEADER_LEN + ECHO_CAPS_LEN + ECHO_WITNESS_PUBKEY_LEN + ECHO_COOKIE_LEN)    // 64
 #define ECHO_BOOTSTRAP_LEN \
     (ECHO_HEADER_LEN + ECHO_COOKIE_LEN + ECHO_EPH_PUBKEY_LEN + ECHO_CLUSTER_KEY_LEN + ECHO_AEAD_TAG_LEN)  // 110
 #define ECHO_BOOTSTRAP_ACK_PT_LEN 5u
@@ -306,15 +312,18 @@ echo_err_t echo_encode_status_detail_not_found(uint8_t *out, size_t out_cap, siz
 
 // DISCOVER
 echo_err_t echo_encode_discover(uint8_t *out, size_t out_cap, size_t *out_len,
-                                 uint8_t sender_id, int64_t timestamp_ms);
+                                 uint8_t sender_id, int64_t timestamp_ms,
+                                 uint16_t capability_flags);
 echo_err_t echo_decode_discover(const uint8_t *buf, size_t buf_len,
-                                 echo_header_t *out_header);
+                                 echo_header_t *out_header,
+                                 uint16_t *out_capability_flags);
 
-// INIT (renamed from UNKNOWN_SOURCE in polish; carries cookie)
+// INIT (carries cookie + 16-bit capability_flags)
 echo_err_t echo_encode_init(uint8_t *out, size_t out_cap, size_t *out_len,
                              int64_t timestamp_ms,
                              const uint8_t witness_pubkey[32],
-                             const uint8_t cookie[ECHO_COOKIE_LEN]);
+                             const uint8_t cookie[ECHO_COOKIE_LEN],
+                             uint16_t capability_flags);
 
 // BOOTSTRAP — carries 16 B cookie in AAD (PROTOCOL.md §5.6).
 echo_err_t echo_encode_bootstrap(uint8_t *out, size_t out_cap, size_t *out_len,

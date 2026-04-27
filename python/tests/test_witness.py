@@ -321,12 +321,12 @@ def test_discover_returns_init_with_pubkey_and_cookie():
 
 
 def test_discover_request_reply_size_match():
-    """Anti-amplification: DISCOVER (62 B) → INIT (62 B), 1.0× factor."""
+    """Anti-amplification: DISCOVER (64 B) → INIT (64 B), 1.0× factor."""
     w, _, _ = make_witness()
     d = proto.Discover(sender_id=NODE_A, timestamp_ms=0)
     pkt = d.encode()
     replies = w.handle_packet(pkt, ("192.168.1.10", 50000))
-    assert len(pkt) == 62 == len(replies[0][0])
+    assert len(pkt) == 64 == len(replies[0][0])
 
 
 def test_discover_does_not_create_node_entry():

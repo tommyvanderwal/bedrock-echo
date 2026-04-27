@@ -304,23 +304,46 @@ def test_status_detail_invalid_block_count_dropped():
 def test_discover_roundtrip():
     d = proto.Discover(sender_id=NODE_A, timestamp_ms=1700000000000)
     wire = d.encode()
-    assert len(wire) == 62  # 14 B header + 48 B zero padding
+    assert len(wire) == 64  # 14 B header + 2 B caps + 48 B zero padding
     assert proto.decode_discover(wire) == d
 
 
-def test_discover_padding_is_zero():
+def test_discover_caps_default_zero_and_padding_zero():
+    """Senders MUST set capability_flags=0 and pad bytes 16..64 to zero
+    in Draft v0.x (PROTOCOL.md §16.2)."""
     d = proto.Discover(sender_id=NODE_A, timestamp_ms=0)
     wire = d.encode()
-    assert wire[14:] == b"\x00" * 48
+    assert wire[14:16] == b"\x00\x00"   # capability_flags u16 BE
+    assert wire[16:] == b"\x00" * 48    # padding
+
+
+def test_discover_capability_flags_round_trip():
+    d = proto.Discover(sender_id=NODE_A, timestamp_ms=0, capability_flags=0xBEEF)
+    wire = d.encode()
+    assert wire[14:16] == b"\xBE\xEF"   # u16 big-endian
+    assert proto.decode_discover(wire).capability_flags == 0xBEEF
+
+
+def test_init_capability_flags_round_trip():
+    pub = bytes(range(32))
+    cookie = bytes(range(16))
+    init = proto.Init(timestamp_ms=0, witness_pubkey=pub, cookie=cookie,
+                      capability_flags=0xCAFE)
+    wire = init.encode()
+    assert wire[14:16] == b"\xCA\xFE"
+    decoded = proto.decode_init(wire)
+    assert decoded.capability_flags == 0xCAFE
+    assert decoded.witness_pubkey == pub
+    assert decoded.cookie == cookie
 
 
 def test_discover_request_size_matches_init_reply_size():
     """Anti-amplification (PROTOCOL.md §1 principle 13): DISCOVER ≥ INIT."""
-    assert proto.DISCOVER_LEN == proto.INIT_LEN == 62
+    assert proto.DISCOVER_LEN == proto.INIT_LEN == 64
 
 
 def test_discover_rejects_wrong_size():
-    with pytest.raises(proto.ProtocolError, match="exactly 62"):
+    with pytest.raises(proto.ProtocolError, match="exactly 64"):
         proto.decode_discover(b"Echo\x04\x01" + b"\x00" * 8 + b"trailing")
 
 
@@ -341,7 +364,7 @@ def test_init_roundtrip():
     cookie = bytes(range(16))
     init = proto.Init(timestamp_ms=1700000000000, witness_pubkey=pub, cookie=cookie)
     wire = init.encode()
-    assert len(wire) == 62
+    assert len(wire) == 64
     assert proto.decode_init(wire) == init
 
 
@@ -361,7 +384,7 @@ def test_init_zero_timestamp_ok():
 
 
 def test_init_rejects_bad_size():
-    with pytest.raises(proto.ProtocolError, match="exactly 62"):
+    with pytest.raises(proto.ProtocolError, match="exactly 64"):
         proto.decode_init(b"Echo\x10\xFF" + b"\x00" * 8)  # too short
 
 

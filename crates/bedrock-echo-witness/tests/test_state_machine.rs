@@ -209,7 +209,7 @@ fn discover_replies_with_pubkey_and_cookie() {
     let mut state = fresh_state(100_000);
     let src = [192, 168, 1, 10];
     let mut out = vec![0u8; DISCOVER_LEN];
-    msg::encode_discover(&mut out, NODE_A, 1_700_000_000_000).unwrap();
+    msg::encode_discover(&mut out, NODE_A, 1_700_000_000_000, 0).unwrap();
     let reply = handle(&mut state, &out, src, 50000, 100_001).unwrap();
     let r = msg::decode_init(reply.as_slice()).unwrap();
     assert_eq!(r.witness_pubkey, &state.witness_pub);
@@ -224,10 +224,10 @@ fn discover_request_size_equals_init_reply_size() {
     let mut state = fresh_state(100_000);
     let src = [192, 168, 1, 10];
     let mut out = vec![0u8; DISCOVER_LEN];
-    msg::encode_discover(&mut out, NODE_A, 1_700_000_000_000).unwrap();
+    msg::encode_discover(&mut out, NODE_A, 1_700_000_000_000, 0).unwrap();
     let reply = handle(&mut state, &out, src, 50000, 100_001).unwrap();
-    assert_eq!(out.len(), 62);
-    assert_eq!(reply.as_slice().len(), 62);
+    assert_eq!(out.len(), 64);
+    assert_eq!(reply.as_slice().len(), 64);
 }
 
 #[test]
@@ -284,7 +284,7 @@ fn full_discover_bootstrap_heartbeat_flow() {
 
     // 1. DISCOVER → INIT with pubkey + cookie.
     let mut d_out = vec![0u8; DISCOVER_LEN];
-    msg::encode_discover(&mut d_out, NODE_A, 1_700_000_000_000).unwrap();
+    msg::encode_discover(&mut d_out, NODE_A, 1_700_000_000_000, 0).unwrap();
     let r1 = handle(&mut state, &d_out, src, 50000, 100_001).unwrap();
     let init = msg::decode_init(r1.as_slice()).unwrap();
     let pubkey: [u8; 32] = *init.witness_pubkey;

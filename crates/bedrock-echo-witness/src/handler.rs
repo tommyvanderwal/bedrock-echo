@@ -57,7 +57,10 @@ pub fn handle(
 
 fn handle_discover(state: &mut State, data: &[u8], src_ipv4: [u8; 4],
                    now_ms: u64) -> Option<Reply> {
-    msg::decode_discover(data).ok()?;
+    // Currently we ignore the node-side capability_flags from DISCOVER —
+    // no capability bits are allocated yet. A future revision can branch
+    // on caps to pick a different reply msg_type.
+    let (_hdr, _node_caps) = msg::decode_discover(data).ok()?;
     if !state.allow_unknown(src_ipv4, now_ms) {
         return None;
     }
@@ -68,6 +71,7 @@ fn handle_discover(state: &mut State, data: &[u8], src_ipv4: [u8; 4],
         state.uptime_ms(now_ms) as i64,
         &state.witness_pub,
         &cookie,
+        0,  // witness capability_flags — none allocated in Draft v0.x
     )
     .ok()?;
     Some(Reply { buf: out, len: n })
@@ -220,6 +224,7 @@ fn handle_heartbeat(state: &mut State, data: &[u8], src_ipv4: [u8; 4],
         state.uptime_ms(now_ms) as i64,
         &state.witness_pub,
         &cookie,
+        0,  // witness capability_flags — none allocated in Draft v0.x
     )
     .ok()?;
     Some(Reply { buf: out, len: n })

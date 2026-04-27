@@ -40,12 +40,20 @@ pub const WITNESS_PUBKEY_LEN: usize = 32;
 pub const COOKIE_LEN: usize = 16;
 pub const WITNESS_COOKIE_SECRET_LEN: usize = 32;
 
+// Forward-compat capability flags in DISCOVER + INIT (PROTOCOL.md §16.2).
+// 16 bits at offset 14 in both messages. Senders in the current draft
+// MUST set all bits to 0; receivers MUST NOT reject on non-zero. Sized
+// so the 32 B pubkey + 16 B cookie that follow it land on 16-byte
+// boundaries.
+pub const CAPS_LEN: usize = 2;
+
 // DISCOVER zero-padding (anti-amp; PROTOCOL.md §1 principle 13, §5.4)
 pub const DISCOVER_PAD_LEN: usize = 48;
 
 // Total packet sizes (fixed for these types)
-pub const DISCOVER_LEN: usize = HEADER_LEN + DISCOVER_PAD_LEN;                // 62
-pub const INIT_LEN: usize = HEADER_LEN + WITNESS_PUBKEY_LEN + COOKIE_LEN;     // 62
+pub const DISCOVER_LEN: usize = HEADER_LEN + CAPS_LEN + DISCOVER_PAD_LEN;     // 64
+pub const INIT_LEN: usize = HEADER_LEN + CAPS_LEN
+    + WITNESS_PUBKEY_LEN + COOKIE_LEN;                                        // 64
 pub const BOOTSTRAP_LEN: usize = HEADER_LEN + COOKIE_LEN + EPH_PUBKEY_LEN
     + CLUSTER_KEY_LEN + AEAD_TAG_LEN;                                         // 110
 pub const BOOTSTRAP_ACK_PLAINTEXT_LEN: usize = 5; // status + witness_uptime_seconds

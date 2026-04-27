@@ -197,9 +197,13 @@ fn vector_08_discover() {
         &mut out,
         j["sender_id"].as_u64().unwrap() as u8,
         j["timestamp_ms"].as_i64().unwrap(),
+        j["capability_flags"].as_u64().unwrap() as u16,
     )
     .unwrap();
     assert_eq!(out, expected);
+
+    let (_hdr, caps) = msg::decode_discover(&expected).unwrap();
+    assert_eq!(caps as u64, j["capability_flags"].as_u64().unwrap());
 }
 
 #[test]
@@ -213,6 +217,7 @@ fn vector_09_init() {
         j["timestamp_ms"].as_i64().unwrap(),
         &pub_arr,
         &cookie,
+        j["capability_flags"].as_u64().unwrap() as u16,
     )
     .unwrap();
     assert_eq!(out, expected);
@@ -227,6 +232,7 @@ fn vector_09_init() {
     let r = msg::decode_init(&expected).unwrap();
     assert_eq!(r.cookie, &cookie);
     assert_eq!(r.witness_pubkey, &pub_arr);
+    assert_eq!(r.capability_flags as u64, j["capability_flags"].as_u64().unwrap());
 }
 
 #[test]

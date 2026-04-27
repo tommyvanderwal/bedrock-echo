@@ -1,9 +1,10 @@
 {
-  "description": "INIT reply carrying witness_pubkey and the anti-spoof cookie for src_ip",
+  "description": "INIT reply (64 B): pubkey + cookie + 16-bit witness capability_flags",
   "msg_type": "0x10 INIT",
   "timestamp_ms": 1700000000054,
   "witness_pubkey": "14ca9e4d387bccf35746e0407daaacc6b28a4f8445ef5a5158894db983e24070",
   "witness_cookie_secret": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
   "src_ip": "192.0.2.10",
-  "cookie": "50ef5370588a5642498b02110f66bca2"
+  "cookie": "50ef5370588a5642498b02110f66bca2",
+  "capability_flags": 0
 }

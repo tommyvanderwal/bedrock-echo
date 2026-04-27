@@ -69,7 +69,7 @@ different protocol.
     that involves a non-trivial reply size is gated by either the cookie
     or AEAD-under-cluster_key — both of which require src_ip ownership
     proof. The single exception is the unauthenticated DISCOVER → INIT
-    exchange, which is amp-neutralised by sizing DISCOVER to 62 B (§5.4)
+    exchange, which is amp-neutralised by sizing DISCOVER to 64 B (§5.4)
     so the reply is never larger than the request.
 
 ---
@@ -112,8 +112,8 @@ Every implementation MUST silently drop any packet where:
 | `0x01` | HEARTBEAT         | node → witness   | AEAD     | 32 + 32N B            |
 | `0x02` | STATUS_LIST       | witness → node   | AEAD     | 35 + 5N B             |
 | `0x03` | STATUS_DETAIL     | witness → node   | AEAD     | 36 (not found) / 44 + 32N B (found) |
-| `0x04` | DISCOVER          | node → witness   | none     | 62 B (zero-padded)    |
-| `0x10` | INIT              | witness → node   | none     | 62 B                  |
+| `0x04` | DISCOVER          | node → witness   | none     | 64 B (zero-padded)    |
+| `0x10` | INIT              | witness → node   | none     | 64 B                  |
 | `0x20` | BOOTSTRAP         | node → witness   | AEAD-DH  | 110 B                 |
 | `0x21` | BOOTSTRAP_ACK     | witness → node   | AEAD     | 35 B                  |
 
@@ -442,22 +442,30 @@ Offset  Size  Name              Type    Description
 6       8     timestamp_ms      caller's wall-clock ms; informational
                                 (DISCOVER is unauthenticated)
 
+── Capability flags (2 B, plaintext) ──────────────────────────────
+14      2     capability_flags  u16, big-endian. Node-side capability
+                                advertisement — see §16.2. Senders in
+                                the current draft MUST set all 16 bits
+                                to 0. Receivers MUST NOT reject on
+                                non-zero; they MAY interpret bits they
+                                understand and MUST ignore bits they
+                                don't.
+
 ── Padding (48 B, plaintext) ───────────────────────────────────────
-14      48    pad               Senders MUST set all bytes to 0.
+16      48    pad               Senders MUST set all bytes to 0.
                                 Receivers MUST ignore the padding
                                 bytes (do NOT reject on non-zero, do
                                 NOT echo or process). Reserved as a
                                 forward-compat extension point — a
                                 future deployment can repurpose any
-                                of these bytes via a new msg_type or
-                                an additional reserved-bits scheme,
+                                of these bytes via a new msg_type,
                                 and current implementations will
                                 accept the packet unchanged.
 ─────────────────────────────────────────────────────────────────────
-Total: 62 bytes (fixed)
+Total: 64 bytes (fixed)
 ```
 
-The padding makes the request size equal to the INIT reply size (62 B),
+The padding makes the request size equal to the INIT reply size (64 B),
 so DISCOVER cannot be used as a UDP amplifier. A spoofed-source DISCOVER
 yields exactly one reply of equal size to the spoofed victim.
 
@@ -492,9 +500,18 @@ Offset  Size  Name              Type    Description
                                 MAY be 0 if no clock source available;
                                 informational only — not authenticated
 
-── Payload (48 B, plaintext) ───────────────────────────────────────
-14      32    witness_pubkey    the witness's X25519 public key
-46      16    cookie            anti-spoof token bound to requester's
+── Capability flags (2 B, plaintext) ──────────────────────────────
+14      2     capability_flags  u16, big-endian. Witness-side capability
+                                advertisement — see §16.2. Senders in
+                                the current draft MUST set all 16 bits
+                                to 0. Receivers MUST NOT reject on
+                                non-zero; they MAY interpret bits they
+                                understand and MUST ignore bits they
+                                don't.
+
+── Payload (48 B, plaintext, 16-byte aligned) ─────────────────────
+16      32    witness_pubkey    the witness's X25519 public key
+48      16    cookie            anti-spoof token bound to requester's
                                 src_ip — see §11.2.
                                 The recipient MUST echo this byte-for-byte
                                 in its next BOOTSTRAP.
@@ -502,8 +519,12 @@ Offset  Size  Name              Type    Description
 ── No trailer ──────────────────────────────────────────────────────
                                 Unauthenticated; no AEAD/HMAC tag.
 ─────────────────────────────────────────────────────────────────────
-Total: 62 bytes
+Total: 64 bytes
 ```
+
+The 2 B capability_flags field also serves as alignment padding so that
+the 32 B `witness_pubkey` and the 16 B `cookie` both start on 16-byte
+boundaries — convenient for parsers using SIMD or word-aligned reads.
 
 **Rate-limited:** witnesses MUST send no more than 1 INIT per source IP
 per second. Excess: silent drop.
@@ -957,7 +978,7 @@ victim's stored sender_ipv4 to an attacker-controlled address.
 ```
 Dashboard has list of candidate witness addresses.
 For each address:
-  Dashboard → witness: DISCOVER (62 B, zero-padded)
+  Dashboard → witness: DISCOVER (64 B, zero-padded)
   witness → Dashboard: INIT (witness_pubkey + cookie)
   Dashboard verifies pubkey against DNSSEC TXT or other trust source.
   Dashboard records (address, pubkey) for operator review.
@@ -1003,7 +1024,7 @@ The vectors:
 | `05_status_list_empty.{json,bin}`           | STATUS_LIST, 0 entries |
 | `06_status_detail_found.{json,bin}`         | STATUS_DETAIL with peer found, 4-block peer_payload |
 | `07_status_detail_not_found.{json,bin}`     | STATUS_DETAIL not-found |
-| `08_discover.{json,bin}`                    | DISCOVER (62 B, zero-padded) |
+| `08_discover.{json,bin}`                    | DISCOVER (64 B, zero-padded) |
 | `09_init.{json,bin}`                        | INIT with pubkey + cookie |
 | `10_bootstrap.{json,bin}`                   | BOOTSTRAP (fixed eph_secret + cluster_key + cookie) |
 | `11_bootstrap_ack_new.{json,bin}`           | BOOTSTRAP_ACK status=0x00 |
@@ -1026,12 +1047,15 @@ would break existing implementations is, by definition, a different
 protocol and ships on a different UDP port (and a different name, if
 publicly identified).
 
-**Forward-compatible extension points:**
+### 16.1 Forward-compatible extension points
 
 - **`msg_type` (primary).** 256 values, 7 used. New `msg_type` values can
   be added at any time. Old implementations silently drop unknown types
   (per §12).
-- **Reserved bits in status bytes (secondary).** STATUS_DETAIL's
+- **`capability_flags` in DISCOVER + INIT (secondary).** The 16-bit
+  field at offset 14 of each (§5.4, §5.5) advertises what the sender
+  is capable of. See §16.2.
+- **Reserved bits in status bytes (tertiary).** STATUS_DETAIL's
   `status_and_blocks` byte and BOOTSTRAP_ACK's `status` byte have
   explicitly-reserved bits (senders MUST zero, receivers MUST ignore).
   Future deployments can use these bits for informational signals that
@@ -1043,6 +1067,51 @@ Reserved msg_type ranges:
 - `0x11–0x1f`: future unauthenticated witness-reply types.
 - `0x22–0x2f`: future bootstrap-related types.
 - `0x30+`: cluster-management or other extensions.
+
+### 16.2 capability_flags semantics
+
+DISCOVER and INIT each carry a 16-bit `capability_flags` field at
+offset 14, just before the rest of the payload. The two fields are
+direction-paired:
+
+- **DISCOVER's `capability_flags`** advertises *node* capabilities to
+  the witness. A witness that recognises a bit MAY respond with a
+  msg_type other than INIT (e.g., a future post-quantum-aware variant
+  reply on a different msg_type) without losing a round-trip.
+- **INIT's `capability_flags`** advertises *witness* capabilities to
+  the node. The node uses this to decide which subsequent flow to
+  use (e.g., whether to BOOTSTRAP via the standard `0x20` path or a
+  future variant).
+
+This lets a "v2-aware" node that hits the heartbeat-first path —
+whose HEARTBEAT under an unknown cluster_key triggers an INIT — learn
+the witness's capabilities from that single INIT response, without
+having to do a separate DISCOVER round-trip.
+
+**Rules for current implementations (Draft v0.x):**
+- All 16 bits MUST be zero on send.
+- Receivers MUST NOT reject a packet because `capability_flags ≠ 0`.
+  Receivers MAY interpret bits they recognise; bits they don't
+  recognise MUST be ignored. (This is the genuine extension-point
+  pattern, the opposite of "reserved-must-be-zero" which is a trap.)
+
+**Rules for future capability allocations:**
+- Each bit is allocated independently. There is no "version number"
+  encoded in the field — bit N enabled means "I support feature N",
+  with no implied transitive support of bits 0..N-1.
+- A capability that triggers a *bigger* reply (e.g., a future PQ
+  pubkey is larger than 32 B) MUST also size the corresponding
+  request such that anti-amplification is preserved (request size ≥
+  reply size). The request side typically does this by bumping its
+  own size when its corresponding `capability_flags` bit is set,
+  e.g., a longer DISCOVER for a PQ-DISCOVER.
+
+**Bit allocations** (none assigned in Draft v0.x — populated as
+features land):
+
+| Bit | Meaning |
+|---:|---|
+| 0..15 | reserved for future allocation |
 
 No specific extension is committed to.
 
@@ -1061,7 +1130,7 @@ No specific extension is committed to.
 - Anti-DDoS: per-source-IP token bucket; INIT rate limit.
 - Anti-amplification, layered:
   - **DISCOVER → INIT** is the only unauthenticated reply path; it is
-    sized 62 B → 62 B (1.0× amp factor) by padding DISCOVER (§5.4).
+    sized 64 B → 64 B (1.0× amp factor) by padding DISCOVER (§5.4).
   - **BOOTSTRAP → BOOTSTRAP_ACK** (110 B → 35 B) is cookie-gated: the
     cookie proves src_ip ownership before the witness will reply.
   - **HEARTBEAT → STATUS_LIST / STATUS_DETAIL** can produce replies

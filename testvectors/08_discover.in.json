@@ -1,7 +1,8 @@
 {
-  "description": "DISCOVER probe (62 B, zero-padded so request size == INIT reply size)",
+  "description": "DISCOVER probe (64 B). 14 B header + 2 B caps + 48 B zero pad. Caps default 0 in Draft v0.x.",
   "msg_type": "0x04 DISCOVER",
   "sender_id": 1,
   "timestamp_ms": 1699999999500,
+  "capability_flags": 0,
   "padding_bytes": 48
 }

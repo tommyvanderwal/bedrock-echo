@@ -73,13 +73,17 @@ static bool handle_discover(echo_state_t *state,
                              const uint8_t src_ipv4[4], uint64_t now_ms,
                              uint8_t *out, size_t out_cap, size_t *out_len) {
     echo_header_t hdr;
-    if (echo_decode_discover(data, data_len, &hdr) != ECHO_OK) return false;
+    uint16_t node_caps = 0;
+    if (echo_decode_discover(data, data_len, &hdr, &node_caps) != ECHO_OK) return false;
+    (void)node_caps;  // no caps allocated yet — could branch on bits in future
     if (!echo_state_allow_unknown(state, src_ipv4, now_ms)) return false;
     int64_t ts_out = (int64_t)echo_state_uptime_ms(state, now_ms);
     uint8_t cookie[ECHO_COOKIE_LEN];
     echo_state_cookie_for(state, src_ipv4, cookie);
     return echo_encode_init(out, out_cap, out_len, ts_out,
-                            state->witness_pub, cookie) == ECHO_OK;
+                            state->witness_pub, cookie,
+                            0u  /* witness caps — none in Draft v0.x */)
+           == ECHO_OK;
 }
 
 // ─── BOOTSTRAP ─────────────────────────────────────────────────────────────
@@ -349,5 +353,7 @@ static bool handle_heartbeat(echo_state_t *state,
     uint8_t cookie[ECHO_COOKIE_LEN];
     echo_state_cookie_for(state, src_ipv4, cookie);
     return echo_encode_init(out, out_cap, out_len, ts_out,
-                            state->witness_pub, cookie) == ECHO_OK;
+                            state->witness_pub, cookie,
+                            0u  /* witness caps — none in Draft v0.x */)
+           == ECHO_OK;
 }

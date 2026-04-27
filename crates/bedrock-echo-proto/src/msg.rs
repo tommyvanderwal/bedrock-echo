@@ -407,10 +407,25 @@ pub fn decode_status_detail_into<'a>(
 
 // ── DISCOVER (0x04) — node → witness, unauthenticated, zero-padded ──────
 
+const CAPS_OFF: usize = HEADER_LEN;                       // 14
+const DISCOVER_PAD_OFF: usize = HEADER_LEN + CAPS_LEN;    // 16
+const INIT_PUBKEY_OFF: usize = HEADER_LEN + CAPS_LEN;     // 16
+const INIT_COOKIE_OFF: usize = INIT_PUBKEY_OFF + WITNESS_PUBKEY_LEN; // 48
+
+#[inline]
+fn write_u16(buf: &mut [u8], off: usize, v: u16) {
+    buf[off..off + 2].copy_from_slice(&v.to_be_bytes());
+}
+#[inline]
+fn read_u16(buf: &[u8], off: usize) -> u16 {
+    u16::from_be_bytes(buf[off..off + 2].try_into().unwrap())
+}
+
 pub fn encode_discover(
     out: &mut [u8],
     sender_id: u8,
     timestamp_ms: i64,
+    capability_flags: u16,
 ) -> Result<usize> {
     validate_node_sender_id(sender_id)?;
     if out.len() < DISCOVER_LEN {
@@ -418,14 +433,15 @@ pub fn encode_discover(
     }
     let hdr = Header { msg_type: MSG_DISCOVER, sender_id, timestamp_ms };
     hdr.pack(&mut out[..HEADER_LEN]);
-    // Zero-pad bytes 14..62 so request size == INIT reply size (anti-amp).
-    for b in &mut out[HEADER_LEN..DISCOVER_LEN] {
+    write_u16(out, CAPS_OFF, capability_flags);
+    // Zero-pad bytes 16..64 so request size == INIT reply size (anti-amp).
+    for b in &mut out[DISCOVER_PAD_OFF..DISCOVER_LEN] {
         *b = 0;
     }
     Ok(DISCOVER_LEN)
 }
 
-pub fn decode_discover(buf: &[u8]) -> Result<Header> {
+pub fn decode_discover(buf: &[u8]) -> Result<(Header, u16)> {
     if buf.len() != DISCOVER_LEN {
         return Err(Error::BadLength);
     }
@@ -434,10 +450,10 @@ pub fn decode_discover(buf: &[u8]) -> Result<Header> {
         return Err(Error::BadMsgType);
     }
     validate_node_sender_id(hdr.sender_id)?;
-    // Spec says senders MUST zero the 48 padding bytes; receivers MAY
-    // check. We don't enforce zero-only here so the witness stays
-    // forward-compatible if a future flag uses one of those bytes.
-    Ok(hdr)
+    let caps = read_u16(buf, CAPS_OFF);
+    // Padding bytes [16..64]: senders MUST zero, receivers MUST NOT
+    // reject on non-zero (forward-compat extension point per §16.2).
+    Ok((hdr, caps))
 }
 
 // ── INIT (0x10) — witness → node, unauthenticated ────────────────────────
@@ -447,6 +463,7 @@ pub fn encode_init(
     timestamp_ms: i64,
     witness_pubkey: &[u8; WITNESS_PUBKEY_LEN],
     cookie: &[u8; COOKIE_LEN],
+    capability_flags: u16,
 ) -> Result<usize> {
     if out.len() < INIT_LEN {
         return Err(Error::BadLength);
@@ -457,8 +474,10 @@ pub fn encode_init(
         timestamp_ms,
     };
     hdr.pack(&mut out[..HEADER_LEN]);
-    out[HEADER_LEN..HEADER_LEN + WITNESS_PUBKEY_LEN].copy_from_slice(witness_pubkey);
-    out[HEADER_LEN + WITNESS_PUBKEY_LEN..INIT_LEN].copy_from_slice(cookie);
+    write_u16(out, CAPS_OFF, capability_flags);
+    out[INIT_PUBKEY_OFF..INIT_PUBKEY_OFF + WITNESS_PUBKEY_LEN]
+        .copy_from_slice(witness_pubkey);
+    out[INIT_COOKIE_OFF..INIT_LEN].copy_from_slice(cookie);
     Ok(INIT_LEN)
 }
 
@@ -466,6 +485,7 @@ pub struct InitReader<'a> {
     pub header: Header,
     pub witness_pubkey: &'a [u8; WITNESS_PUBKEY_LEN],
     pub cookie: &'a [u8; COOKIE_LEN],
+    pub capability_flags: u16,
 }
 
 pub fn decode_init(buf: &[u8]) -> Result<InitReader<'_>> {
@@ -477,11 +497,18 @@ pub fn decode_init(buf: &[u8]) -> Result<InitReader<'_>> {
         return Err(Error::BadMsgType);
     }
     validate_witness_sender_id(hdr.sender_id)?;
+    let caps = read_u16(buf, CAPS_OFF);
     let witness_pubkey: &[u8; WITNESS_PUBKEY_LEN] =
-        buf[HEADER_LEN..HEADER_LEN + WITNESS_PUBKEY_LEN].try_into().unwrap();
+        buf[INIT_PUBKEY_OFF..INIT_PUBKEY_OFF + WITNESS_PUBKEY_LEN]
+            .try_into().unwrap();
     let cookie: &[u8; COOKIE_LEN] =
-        buf[HEADER_LEN + WITNESS_PUBKEY_LEN..INIT_LEN].try_into().unwrap();
-    Ok(InitReader { header: hdr, witness_pubkey, cookie })
+        buf[INIT_COOKIE_OFF..INIT_LEN].try_into().unwrap();
+    Ok(InitReader {
+        header: hdr,
+        witness_pubkey,
+        cookie,
+        capability_flags: caps,
+    })
 }
 
 // ── BOOTSTRAP (0x20) — node → witness, AEAD via ECDH ─────────────────────

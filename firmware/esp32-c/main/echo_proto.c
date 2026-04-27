@@ -246,47 +246,77 @@ echo_err_t echo_encode_status_detail_not_found(uint8_t *out, size_t out_cap, siz
     return ECHO_OK;
 }
 
-// ─── DISCOVER (0x04) — zero-padded to 62 B for anti-amplification ─────────
+// ─── DISCOVER (0x04) — zero-padded to 64 B for anti-amplification ─────────
+//
+// Layout (PROTOCOL.md §5.4):
+//   [0..14]   header
+//   [14..16]  capability_flags (u16 BE) — node-side caps advert (§16.2)
+//   [16..64]  zero padding
+
+#define ECHO_CAPS_OFF        ECHO_HEADER_LEN                          // 14
+#define ECHO_DISCOVER_PAD_OFF (ECHO_HEADER_LEN + ECHO_CAPS_LEN)       // 16
+#define ECHO_INIT_PUBKEY_OFF (ECHO_HEADER_LEN + ECHO_CAPS_LEN)        // 16
+#define ECHO_INIT_COOKIE_OFF (ECHO_INIT_PUBKEY_OFF + ECHO_WITNESS_PUBKEY_LEN) // 48
+
+static inline void wr_u16_be(uint8_t *p, uint16_t v) {
+    p[0] = (v >> 8) & 0xFF; p[1] = v & 0xFF;
+}
+static inline uint16_t rd_u16_be(const uint8_t *p) {
+    return ((uint16_t)p[0] << 8) | (uint16_t)p[1];
+}
 
 echo_err_t echo_encode_discover(uint8_t *out, size_t out_cap, size_t *out_len,
-                                 uint8_t sender_id, int64_t timestamp_ms) {
+                                 uint8_t sender_id, int64_t timestamp_ms,
+                                 uint16_t capability_flags) {
     if (sender_id > ECHO_NODE_SENDER_ID_MAX) return ECHO_ERR_BAD_SENDER_ID;
     if (out_cap < ECHO_DISCOVER_LEN) return ECHO_ERR_BAD_LENGTH;
     echo_header_t hdr = { .msg_type = ECHO_MSG_DISCOVER,
                           .sender_id = sender_id,
                           .timestamp_ms = timestamp_ms };
     echo_header_pack(out, &hdr);
-    // Bytes 14..62: MUST be zero on send (PROTOCOL.md §5.4).
-    memset(out + ECHO_HEADER_LEN, 0, ECHO_DISCOVER_PAD_LEN);
+    wr_u16_be(out + ECHO_CAPS_OFF, capability_flags);
+    memset(out + ECHO_DISCOVER_PAD_OFF, 0, ECHO_DISCOVER_PAD_LEN);
     *out_len = ECHO_DISCOVER_LEN;
     return ECHO_OK;
 }
 
 echo_err_t echo_decode_discover(const uint8_t *buf, size_t buf_len,
-                                 echo_header_t *out_header) {
+                                 echo_header_t *out_header,
+                                 uint16_t *out_capability_flags) {
     if (buf_len != ECHO_DISCOVER_LEN) return ECHO_ERR_BAD_LENGTH;
     echo_err_t e = echo_header_unpack(out_header, buf, buf_len);
     if (e != ECHO_OK) return e;
     if (out_header->msg_type != ECHO_MSG_DISCOVER) return ECHO_ERR_BAD_MSG_TYPE;
     if (out_header->sender_id > ECHO_NODE_SENDER_ID_MAX) return ECHO_ERR_BAD_SENDER_ID;
-    // Padding bytes are MAY-check; we don't enforce zero-only so future
-    // forward-compat use of those bytes via msg_type extension stays open.
+    if (out_capability_flags) {
+        *out_capability_flags = rd_u16_be(buf + ECHO_CAPS_OFF);
+    }
+    // Padding bytes [16..64]: receivers MUST NOT reject on non-zero
+    // (forward-compat extension point per §16.2).
     return ECHO_OK;
 }
 
 // ─── INIT (0x10) — witness reply, carries pubkey + 16 B cookie ────────────
+//
+// Layout (PROTOCOL.md §5.5):
+//   [0..14]   header
+//   [14..16]  capability_flags (u16 BE) — witness-side caps advert (§16.2)
+//   [16..48]  witness_pubkey (32 B, 16-byte aligned)
+//   [48..64]  cookie (16 B, 16-byte aligned)
 
 echo_err_t echo_encode_init(uint8_t *out, size_t out_cap, size_t *out_len,
                              int64_t timestamp_ms,
                              const uint8_t witness_pubkey[32],
-                             const uint8_t cookie[ECHO_COOKIE_LEN]) {
+                             const uint8_t cookie[ECHO_COOKIE_LEN],
+                             uint16_t capability_flags) {
     if (out_cap < ECHO_INIT_LEN) return ECHO_ERR_BAD_LENGTH;
     echo_header_t hdr = { .msg_type = ECHO_MSG_INIT,
                           .sender_id = ECHO_WITNESS_SENDER_ID,
                           .timestamp_ms = timestamp_ms };
     echo_header_pack(out, &hdr);
-    memcpy(out + ECHO_HEADER_LEN, witness_pubkey, 32);
-    memcpy(out + ECHO_HEADER_LEN + 32, cookie, ECHO_COOKIE_LEN);
+    wr_u16_be(out + ECHO_CAPS_OFF, capability_flags);
+    memcpy(out + ECHO_INIT_PUBKEY_OFF, witness_pubkey, 32);
+    memcpy(out + ECHO_INIT_COOKIE_OFF, cookie, ECHO_COOKIE_LEN);
     *out_len = ECHO_INIT_LEN;
     return ECHO_OK;
 }

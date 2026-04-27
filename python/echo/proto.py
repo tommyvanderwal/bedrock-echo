@@ -77,13 +77,19 @@ WITNESS_PUBKEY_LEN = 32
 COOKIE_LEN = 16
 WITNESS_COOKIE_SECRET_LEN = 32
 
+# Forward-compat capability flags in DISCOVER + INIT (PROTOCOL.md §16.2).
+# Senders in the current draft MUST set all bits to 0; receivers MUST NOT
+# reject on non-zero. Sized to align the 32 B pubkey + 16 B cookie that
+# follow it on 16-byte boundaries.
+CAPS_LEN = 2  # bytes (u16 BE)
+
 # DISCOVER zero-padding to make request size == INIT reply size
 # (anti-amplification — PROTOCOL.md §1 principle 13, §5.4)
 DISCOVER_PAD_LEN = 48
 
 # total packet sizes
-DISCOVER_LEN = HEADER_LEN + DISCOVER_PAD_LEN                                 # 62
-INIT_LEN = HEADER_LEN + WITNESS_PUBKEY_LEN + COOKIE_LEN                      # 62
+DISCOVER_LEN = HEADER_LEN + CAPS_LEN + DISCOVER_PAD_LEN                      # 64
+INIT_LEN = HEADER_LEN + CAPS_LEN + WITNESS_PUBKEY_LEN + COOKIE_LEN           # 64
 BOOTSTRAP_LEN = (HEADER_LEN + COOKIE_LEN + EPH_PUBKEY_LEN
                  + CLUSTER_KEY_LEN + AEAD_TAG_LEN)                           # 110
 BOOTSTRAP_ACK_PLAINTEXT_LEN = 5  # status (1) + witness_uptime_seconds (4)
@@ -417,16 +423,19 @@ def decode_status_detail(buf: bytes, cluster_key: bytes) -> StatusDetail:
 
 @dataclass(frozen=True)
 class Discover:
-    sender_id: int       # node's chosen ID; can be any 0x00..0xFE
-    timestamp_ms: int    # caller's wall-clock; useful for RTT measurement
+    sender_id: int            # node's chosen ID; 0x00..0xFE
+    timestamp_ms: int         # caller's wall-clock; informational
+    capability_flags: int = 0 # u16 BE — node-side capability advert (§16.2)
 
     def encode(self) -> bytes:
         _validate_node_sender_id(self.sender_id)
-        # 14 B header + 48 B zero padding = 62 B total. The padding makes
-        # the request size match the INIT reply size, so DISCOVER cannot
-        # be used as a UDP amplifier.
+        if not (0 <= self.capability_flags <= 0xFFFF):
+            raise ProtocolError("capability_flags must fit in u16")
+        # 14 B header + 2 B caps + 48 B zero padding = 64 B. The padding
+        # keeps DISCOVER == INIT size for anti-amplification.
         header = Header(MSG_DISCOVER, self.sender_id, self.timestamp_ms).pack()
-        return header + b"\x00" * DISCOVER_PAD_LEN
+        caps = struct.pack(">H", self.capability_flags)
+        return header + caps + b"\x00" * DISCOVER_PAD_LEN
 
 
 def decode_discover(buf: bytes) -> Discover:
@@ -438,10 +447,12 @@ def decode_discover(buf: bytes) -> Discover:
     if header.msg_type != MSG_DISCOVER:
         raise ProtocolError("not a DISCOVER")
     _validate_node_sender_id(header.sender_id)
-    # Padding bytes 14..62: spec says senders MUST zero, witness MAY check.
-    # We don't enforce zero-only here so the witness can be lenient against
-    # future forward-compat use; the protocol tests verify zero on encode.
-    return Discover(sender_id=header.sender_id, timestamp_ms=header.timestamp_ms)
+    caps, = struct.unpack_from(">H", buf, HEADER_LEN)
+    # Padding bytes [16..64]: spec says senders MUST zero, receivers MUST
+    # NOT reject on non-zero (forward-compat extension point).
+    return Discover(sender_id=header.sender_id,
+                    timestamp_ms=header.timestamp_ms,
+                    capability_flags=caps)
 
 
 # ── INIT (0x10) — witness → node, unauthenticated ─────────────────────────
@@ -452,14 +463,18 @@ class Init:
     timestamp_ms: int           # witness's best-effort wall-clock; MAY be 0
     witness_pubkey: bytes       # X25519 public key, 32 bytes
     cookie: bytes               # 16 B, cookie(witness_secret, src_ip), §11.2
+    capability_flags: int = 0   # u16 BE — witness-side capability advert (§16.2)
 
     def encode(self) -> bytes:
         if len(self.witness_pubkey) != WITNESS_PUBKEY_LEN:
             raise ProtocolError("witness_pubkey must be 32 bytes")
         if len(self.cookie) != COOKIE_LEN:
             raise ProtocolError(f"cookie must be {COOKIE_LEN} bytes")
-        header = Header(MSG_INIT, WITNESS_SENDER_ID, self.timestamp_ms)
-        return header.pack() + self.witness_pubkey + self.cookie
+        if not (0 <= self.capability_flags <= 0xFFFF):
+            raise ProtocolError("capability_flags must fit in u16")
+        header = Header(MSG_INIT, WITNESS_SENDER_ID, self.timestamp_ms).pack()
+        caps = struct.pack(">H", self.capability_flags)
+        return header + caps + self.witness_pubkey + self.cookie
 
 
 def decode_init(buf: bytes) -> Init:
@@ -471,10 +486,14 @@ def decode_init(buf: bytes) -> Init:
     if header.msg_type != MSG_INIT:
         raise ProtocolError("not INIT")
     _validate_witness_sender_id(header.sender_id)
+    caps, = struct.unpack_from(">H", buf, HEADER_LEN)
+    pub_off = HEADER_LEN + CAPS_LEN
+    cookie_off = pub_off + WITNESS_PUBKEY_LEN
     return Init(
         timestamp_ms=header.timestamp_ms,
-        witness_pubkey=bytes(buf[HEADER_LEN:HEADER_LEN + WITNESS_PUBKEY_LEN]),
-        cookie=bytes(buf[HEADER_LEN + WITNESS_PUBKEY_LEN:INIT_LEN]),
+        witness_pubkey=bytes(buf[pub_off:pub_off + WITNESS_PUBKEY_LEN]),
+        cookie=bytes(buf[cookie_off:INIT_LEN]),
+        capability_flags=caps,
     )
 
 

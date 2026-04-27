@@ -1,24 +1,23 @@
 # Bedrock Echo Protocol
 
-**Status: Draft v0.x.** The current wire format is stable enough for
-interoperability testing — three reference implementations agree
-byte-for-byte via 12 canonical test vectors — but not frozen. Breaking
-changes may still happen before v1.0 based on implementation feedback,
-security review, and BedRock integration testing.
+**Status: Draft v0.x.** Stable enough for interoperability testing —
+three reference implementations agree byte-for-byte via 12 canonical
+test vectors — but not frozen. Breaking changes may still happen
+before v1.0 based on implementation feedback, security review, and
+BedRock integration testing.
 
-Once v1.0 is reached, the wire format becomes immutable: the protocol
-is named "Echo" with no version field, and a genuinely different
-protocol ships on a different UDP port (not a new version of Echo).
-The "v0.x → v1.0" labelling exists only on this document during the
-draft phase; the wire itself has never carried a version byte and
-never will.
+Once v1.0 is reached, the existing wire format is fixed for the
+existing message types. Future extensions remain possible and are
+**always backwards-compatible with original clients** — see §16. There
+is no version field on the wire and there never will be; "v0.x →
+v1.0" labelling exists only on this document during the draft phase.
 
-**Transport:** UDP, default port **12321** (configurable by deployment; the
-port number is not part of the protocol itself).
-**One message = one UDP datagram.** Every message fits in a single datagram
-under typical Ethernet MTU (≤ 1400 B). The protocol has no fragmentation and
-no streaming; a deployment needing more uses a different UDP port for a
-different protocol.
+**Transport:** UDP, default port **12321** (port number is not part
+of the protocol). **One message = one UDP datagram.** Current message
+types all fit in a single datagram ≤ 1400 B, so IP fragmentation
+SHOULD not be needed in practice. The protocol does not rely on
+fragmentation, but does not forbid it either — a future msg_type that
+warrants larger payloads is free to use whatever the path supports.
 
 ---
 
@@ -31,15 +30,24 @@ different protocol.
 3. **No strings on the wire.** Identifiers are fixed-size bytes/integers.
 4. **No floats.** Timestamps are `int64` ms since Unix epoch; durations are
    `uint32` ms or `uint32` seconds depending on the field.
-5. **Every datagram ≤ 1400 bytes.** Below Ethernet UDP MTU with margin. No IP
-   fragmentation ever.
+5. **Current message types fit in ≤ 1400-byte datagrams.** Below
+   typical Ethernet UDP MTU with margin, so IP fragmentation SHOULD
+   not be needed for any of today's flows. Not a hard prohibition —
+   a future msg_type that needs larger payloads can rely on whatever
+   the path supports.
 6. **Strict parsing.** Wrong magic, bad length, bad AEAD tag = silent drop. No
    lenient mode, no partial parse, no "ignore unknown fields" except where
-   explicitly defined as forward-compat reserved bits in a status byte.
-7. **No protocol version field.** The magic is `Echo`, forever. If a genuinely
-   different protocol is needed later, it ships on a different UDP port — not
-   as a version bump over this one. This avoids the "old firmware in the wild
-   breaking when we upgrade" failure mode.
+   explicitly defined as forward-compat (reserved bits in a status byte;
+   `capability_flags`; unknown `msg_type` values).
+7. **No protocol version field — and none needed.** The magic is
+   `Echo`, forever. Forward-compat lives in defined extension points
+   (see principle 8 and §16): `capability_flags`, reserved status
+   bits, and unallocated `msg_type` values. All are MUST-ignore for
+   receivers that don't recognise them, so future extensions are
+   always backwards-compatible with original clients. A genuinely
+   incompatible new protocol — one that would require breaking the
+   existing wire — ships on a different UDP port with a different
+   name, not as a "version 2" of Echo.
 8. **`msg_type` is the primary extension point.** 256 values, 7 used today.
    Unknown `msg_type` → silent drop, so old implementations forward-compat
    by design.
@@ -865,7 +873,9 @@ The witness silently drops any packet that:
 
 1. Has wrong magic, unknown msg_type, or UDP length inconsistent with the
    declared message structure.
-2. Exceeds 1400 bytes.
+2. Exceeds 1400 bytes for any of the currently-defined message types
+   (none of which need more). A future msg_type permitted to exceed
+   1400 B would carry its own size rule.
 3. Has `sender_id == 0xFF` in a node→witness message.
 4. Fails AEAD tag verification (for AEAD-protected types).
 5. Has `timestamp_ms` that fails per-sender monotonic check (for
@@ -1041,11 +1051,13 @@ Every conformant implementation MUST pass all vectors:
 
 ## 16. Compatibility and extension
 
-**No protocol version field, intentionally.** The magic bytes `Echo` are
-the permanent protocol identifier. Any change to the wire format that
-would break existing implementations is, by definition, a different
-protocol and ships on a different UDP port (and a different name, if
-publicly identified).
+**No version field, by design.** The magic bytes `Echo` are the
+permanent protocol identifier. Forward-compat lives in three defined
+extension points (§16.1) — all MUST-ignore for receivers that don't
+recognise them, so **future extensions are always backwards-compatible
+with original clients**. A genuinely incompatible *different* protocol
+ships on a different UDP port with a different name — never as a
+"version 2" of Echo.
 
 ### 16.1 Forward-compatible extension points
 

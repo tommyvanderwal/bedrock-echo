@@ -240,5 +240,5 @@ Dual-licensed under your choice of:
 - [MIT License](LICENSE-MIT)
 - [Apache License, Version 2.0](LICENSE-APACHE)
 
-— the standard Rust-ecosystem dual licence. Pick whichever you prefer for
-your downstream use.
+This is the standard dual-license used by much of the Rust ecosystem.  
+You are free to use, implement, modify, and distribute Bedrock Echo in any project (open-source or closed-source, commercial or non-commercial) with no further permission required.

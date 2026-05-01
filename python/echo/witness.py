@@ -43,7 +43,8 @@ MAX_TRACKED_IPS = 128
 # Token bucket (PROTOCOL.md §11)
 RL_RATE_PER_SEC = 10
 RL_BURST = 20
-RL_UNKNOWN_PER_SEC = 1
+RL_UNKNOWN_PER_SEC = 1     # steady-state replenishment of unknown-reply tokens
+RL_UNKNOWN_BURST = 10      # short bursts of INIT redirects allowed (reconnect / rebootstrap windows)
 
 # Age-out tiers (PROTOCOL.md §10): (threshold_inclusive, timeout_ms)
 AGE_OUT_TIERS = (
@@ -89,6 +90,12 @@ class RateLimiter:
     tokens: float
     last_refill_ms: int
     last_unknown_ms: int = 0
+    # Separate token bucket for "unknown reply" (INIT redirected to a
+    # HEARTBEAT whose (src_ip, sender_id) has no node entry). Allows
+    # bursts during reconnect / rebootstrap without changing the long-
+    # term anti-amp guarantee.
+    unknown_tokens: float = 0.0
+    unknown_last_refill_ms: int = 0
 
 
 # ── Witness ──────────────────────────────────────────────────────────────
@@ -202,7 +209,11 @@ class Witness:
                 oldest = min(self.rate_limits.items(),
                              key=lambda kv: kv[1].last_refill_ms)
                 del self.rate_limits[oldest[0]]
-            rl = RateLimiter(tokens=float(RL_BURST), last_refill_ms=now)
+            rl = RateLimiter(
+                tokens=float(RL_BURST), last_refill_ms=now,
+                unknown_tokens=float(RL_UNKNOWN_BURST),
+                unknown_last_refill_ms=now,
+            )
             self.rate_limits[ipv4] = rl
 
         elapsed = (now - rl.last_refill_ms) / 1000.0
@@ -210,9 +221,20 @@ class Witness:
         rl.last_refill_ms = now
 
         if is_unknown_reply:
-            if now - rl.last_unknown_ms < int(1000 / RL_UNKNOWN_PER_SEC):
+            # Token-bucket on the unknown-reply path so a daemon that
+            # restarts and re-bootstraps quickly doesn't get its INIT
+            # redirects throttled into oblivion. Burst of 10, refilled
+            # at RL_UNKNOWN_PER_SEC. Steady-state amplification limit
+            # is unchanged.
+            unk_elapsed = (now - rl.unknown_last_refill_ms) / 1000.0
+            rl.unknown_tokens = min(
+                float(RL_UNKNOWN_BURST),
+                rl.unknown_tokens + unk_elapsed * RL_UNKNOWN_PER_SEC,
+            )
+            rl.unknown_last_refill_ms = now
+            if rl.unknown_tokens < 1.0:
                 return False
-            rl.last_unknown_ms = now
+            rl.unknown_tokens -= 1.0
             return True
 
         if rl.tokens < 1.0:
